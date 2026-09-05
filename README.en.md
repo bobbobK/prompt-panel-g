@@ -71,6 +71,10 @@ Korean, English, Japanese, Chinese (Simplified), Chinese (Traditional), Polish, 
 - The character card JSON export uses the V3 spec's `data.*` path as the source of truth and clears the V1-compat top-level duplicates to keep the file lean. SillyTavern reads `data.*` first on import, so compatibility is unaffected.
 
 
-## License
+## License & Attribution
 
-AGPL-3.0. See [LICENSE](LICENSE) for the full text.
+This extension is a **modified fork** of [anon4961/prompt-panel](https://github.com/anon4961/prompt-panel).
+
+- All licensing follows the license stated in the original project (**AGPL-3.0**). See [LICENSE](LICENSE) for the full text.
+- The original copyright and license notices are kept intact.
+- This repository modifies parts of the original code's features and UI.
