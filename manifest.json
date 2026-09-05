@@ -1,6 +1,6 @@
 {
-    "display_name": "Prompt Panel",
-    "name": "prompt-panel",
+    "display_name": "Prompt Panel G",
+    "name": "prompt-panel-g",
     "version": "1.1.0",
     "description": "Read, translate, search, and export SillyTavern presets, world info, and character cards. Supports per-toggle translation, in-content search across original and translated text, token counting, and export to TXT/JSON.",
     "auto_update": true,

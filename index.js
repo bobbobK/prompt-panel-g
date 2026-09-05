@@ -2,7 +2,7 @@
   * Prompt Panel
  */
 
-const EXT    = 'prompt-panel';
+const EXT    = 'prompt-panel-g';
 // CSS URL is derived from this script's own URL (import.meta.url) so it works
 // regardless of the actual folder name on disk (e.g. when installed via GitHub
 // the folder may be named after the repo, not after EXT).
@@ -19,7 +19,9 @@ const PDOC = (function(p){ try { return p.document || document; } catch(e){ retu
 let getRequestHeaders, saveSettingsDebounced, eventSource, event_types,
     extension_settings, getContext,
     oai_settings, openai_settings, openai_setting_names,
-    characters, unshallowCharacter, world_names, world_info, getSortedEntries;
+    getChatCompletionPreset, promptManager,
+    characters, unshallowCharacter, world_names, world_info, getSortedEntries,
+    setWIOriginalDataValue;
 
 async function initImports() {
     const s = import.meta.url;
@@ -39,6 +41,11 @@ async function initImports() {
     oai_settings         = om.oai_settings;
     openai_settings      = om.openai_settings;
     openai_setting_names = om.openai_setting_names;
+    // Used by applyPresetLive() to write translations straight back into ST
+    // (same save path ST's own preset "update" button uses) instead of
+    // downloading a file the person has to re-import by hand.
+    getChatCompletionPreset = om.getChatCompletionPreset;
+    promptManager            = om.promptManager;
 
     const em = await import(base2 + 'extensions.js');
     extension_settings = em.extension_settings;
@@ -48,10 +55,18 @@ async function initImports() {
     getSortedEntries = wi.getSortedEntries;
     world_names      = wi.world_names;
     world_info       = wi.world_info;
+    // Used by applyWorldInfoLive() to keep a character-book's `originalData`
+    // mirror in sync with the entries we rewrite (ST does the same on edit).
+    setWIOriginalDataValue = wi.setWIOriginalDataValue;
 }
 
 // ── Providers ─────────────────────────────────────────────────────────
+// Selecting this hands the whole request to SillyTavern's Connection Manager:
+// the profile already carries the API, model, key, proxy and completion preset,
+// so the panel's own provider/model/parameter/proxy controls are hidden.
+const ST_PROFILE = '__st_profile__';
 const PROVIDER_LIST = [
+    { key: ST_PROFILE,   label: '⭐ ST 프로필',      source: ST_PROFILE   },
     { key: 'openai',     label: 'OpenAI',           source: 'openai'     },
     { key: 'claude',     label: 'Claude',           source: 'claude'     },
     { key: 'google',     label: 'Google AI Studio', source: 'makersuite' },
@@ -116,6 +131,12 @@ function cfg() {
     if (!extension_settings[EXT]) extension_settings[EXT] = {};
     const c = extension_settings[EXT];
     if (!c.targetLang)    c.targetLang    = 'Korean';
+    // Per-area target languages. '__same__' = follow 본문(targetLang), which is
+    // the default so existing installs keep behaving exactly as before.
+    if (!c.titleLang)     c.titleLang     = '__same__';
+    // 주석 has no "follow 본문" mode — a 주석 is a reading aid, so it defaults to
+    // 한국어 outright. Migrate anyone still carrying the old '__same__' value.
+    if (!c.noteLang || c.noteLang === '__same__') c.noteLang = 'Korean';
     if (!c.provider)      c.provider      = 'openai';
     if (!c.model)         c.model         = 'gpt-4o-mini';
     if (c.prefillEnabled === undefined) c.prefillEnabled = true;
@@ -242,13 +263,28 @@ async function initTranslationCache() {
 // The dropdown may hold the sentinel '__custom__', in which case the user's
 // free-text language (customLang) is what we actually send to the model and
 // what we key the cache by. Never let '__custom__' itself reach a cache key.
-function effLang() {
-    const c = cfg();
-    if (c.targetLang === '__custom__') {
-        const custom = (c.customLang || '').trim();
-        return custom || 'Korean';
+function resolveLang(sel, custom) {
+    if (sel === '__custom__') {
+        const v = (custom || '').trim();
+        return v || 'Korean';
     }
-    return c.targetLang || 'Korean';
+    return sel || 'Korean';
+}
+
+// effLang(area) — area is 'title' | 'note' | undefined (= 본문/body, the default).
+// 제목/주석 default to '__same__', meaning they follow the 본문 language, so an
+// install that never touches the new selects behaves identically to before.
+function effLang(area) {
+    const c = cfg();
+    const body = resolveLang(c.targetLang, c.customLang);
+    if (area === 'title') {
+        if (!c.titleLang || c.titleLang === '__same__') return body;
+        return resolveLang(c.titleLang, c.titleCustomLang);
+    }
+    if (area === 'note') {
+        return resolveLang(c.noteLang || 'Korean', c.noteCustomLang);
+    }
+    return body;
 }
 
 const ck        = (ns, id) => `${ns}::${id}::${effLang()}`;
@@ -265,24 +301,29 @@ const setCache  = (ns, id, t) => {
 //   - 👀 and script export prefer the full translation's title when present,
 //     and fall back to the title-only cache otherwise.
 const titleNS = (ns) => `${ns}@title`;
+// Title entries are keyed by the 제목 language, body entries by the 본문 language,
+// so the two areas can target different languages without colliding. When 제목 is
+// left at '__same__' both resolve to the same string and the keys are unchanged
+// from previous versions (existing caches keep matching).
+const ckT = (ns, id) => `${titleNS(ns)}::${id}::${effLang('title')}`;
 // Drop a title-only entry. Called when a full translation succeeds, so the
 // newer full translation's title wins. Without this, a stale title-only
 // result would keep overriding it (title cache has higher precedence).
 const clearCachedTitle = (ns, id) => {
-    const key = ck(titleNS(ns), id);
+    const key = ckT(ns, id);
     translationMap.delete(key);
     dbDelete(key);
 };
-const getCachedTitle = (ns, id) => translationMap.get(ck(titleNS(ns), id)) ?? null;
+const getCachedTitle = (ns, id) => translationMap.get(ckT(ns, id)) ?? null;
 const setCacheTitle  = (ns, id, t) => {
-    const key = ck(titleNS(ns), id);
+    const key = ckT(ns, id);
     translationMap.set(key, t);
     dbPut(key, t);
 };
 
 const clearNS = (ns, ids) => {
     ids.forEach(id => {
-        [ck(ns, id), ck(titleNS(ns), id)].forEach(key => {
+        [ck(ns, id), ckT(ns, id)].forEach(key => {
             translationMap.delete(key);
             dbDelete(key);
         });
@@ -308,59 +349,91 @@ function estimateTokens(text) {
 
 let isBusy=false, stopReq=false;
 
-// ── Translation ─────────────────────────────────────────────────
-async function translateText(name, text, extraNonce) {
-    const hasName    = !!(name && name.trim());
-    const hasContent = !!(text && text.trim());
-    // Nothing translatable at all → skip
-    if (!hasName && !hasContent) return '';
+// Each tab registers { sleep, wake } here. A loaded 프리셋 can be 471 toggles
+// (~100KB of text), which becomes several thousand DOM nodes plus their
+// listeners — and a closed panel is only display:none, so all of it stayed in
+// SillyTavern's document. ST's own $()/querySelectorAll calls walk that tree
+// and every style invalidation recomputes it, which is what made ST sluggish
+// after the panel had been used. Closing now drops the rendered rows; `items`
+// stays in JS memory so reopening re-renders without touching the source.
+const PAGE_HOOKS = [];
+function sleepPages() { for (const h of PAGE_HOOKS) { try { h.sleep(); } catch (e) { console.warn(`[${EXT}] page sleep failed`, e); } } }
+function wakePages()  { for (const h of PAGE_HOOKS) { try { h.wake();  } catch (e) { console.warn(`[${EXT}] page wake failed`, e); } } }
+
+// ── Connection-profile plumbing ───────────────────────────────────────
+const usingStProfile = () => (cfg().provider || 'openai') === ST_PROFILE;
+
+function getConnSvc() {
+    try { return SillyTavern?.getContext?.()?.ConnectionManagerRequestService || null; }
+    catch (e) { return null; }
+}
+
+// Profiles the Connection Manager exposes for chat/text completion. Returns []
+// (never throws) so the settings UI can degrade to a plain message.
+function listStProfiles() {
+    const svc = getConnSvc();
+    if (!svc?.getSupportedProfiles) return [];
+    try {
+        return (svc.getSupportedProfiles() || [])
+            .filter(pr => pr && pr.id)
+            .map(pr => ({ id: pr.id, name: pr.name || pr.id, api: pr.api || '', model: pr.model || '' }));
+    } catch (e) {
+        console.warn(`[${EXT}] connection profiles unavailable`, e);
+        return [];
+    }
+}
+
+// The service needs an explicit token budget. Size it from the request itself —
+// a translation is roughly as long as its source, so 2× plus a floor covers
+// both a one-line label and a long prompt block.
+function budgetFor(messages) {
+    const text = messages.map(m => m?.content || '').join('\n');
+    return Math.min(32768, Math.max(1024, Math.ceil(estimateTokens(text) * 2)));
+}
+
+// Single exit point for every model call. `tweak` may adjust the raw-provider
+// payload (used by 재번역 to nudge sampling); it is ignored on the profile path,
+// where sampling belongs to the profile's own completion preset.
+async function runCompletion(messages, tweak) {
     const c = cfg();
-    const lang = effLang();
-    const nonce = extraNonce ? `\n<!--retry:${extraNonce}-->` : '';
-    // Compose what we send to the model:
-    //   - name + content → "### {name}\n\n{content}"
-    //   - name only     → "### {name}"   (title-only translation)
-    //   - content only  → "{content}"
-    const combined = hasName && hasContent
-        ? `### ${name}\n\n${text}`
-        : (hasName ? `### ${name}` : text);
 
-    const prompt =
-`Translate the following text into ${lang}.
-
-RULES:
-1. Translate ALL human-readable text including headings, labels, titles, and body content.
-2. Do NOT translate: HTML/XML tags, {{char}}, {{user}}, {{getvar::*}}, {{setvar::*}}, {{random::*}}, regex patterns, JSON keys, code, URLs, emoji.
-3. Do NOT alter references to languages, nationalities, cultures, or styles. For example: if the source says "Chinese style" or "中文风格" or "중국식", translate those words literally — do NOT replace them with the target language name.
-4. Preserve all markdown, whitespace, indentation, and line breaks exactly.
-5. Output ONLY the translated text — no preamble, no "Here is:", no meta-commentary.
-6. Never echo the source text back unchanged. Even if the source is already close to ${lang}, produce a proper ${lang} rendering.
-7. If a line starts with "**Keys:**" or "**Filters:**", keep that exact prefix and the comma-separated list format, and keep it on its own line at the top. Translate each item into ${lang}. These are trigger keywords, so render them as the natural word a reader would actually type, not as a literal gloss.
-
---- SOURCE ---
-${combined}
---- END ---
-
-Now output the above text translated into ${lang}.${nonce}`;
-
-    const prov = c.provider||'openai';
-    const source = PROVIDER_TO_SOURCE[prov]||prov;
-    const model = (c.model==='__custom__' ? (c.customModelName||'') : (c.model||'')) || '';
-
-    const messages = [{ role:'user', content:prompt }];
-    if (c.prefillEnabled && c.prefillText?.trim()) {
-        const role = (source==='makersuite'||source==='google'||source==='vertexai') ? 'model' : 'assistant';
-        messages.push({ role, content:c.prefillText.trim() });
+    if (usingStProfile()) {
+        const svc = getConnSvc();
+        if (!svc?.sendRequest) throw new Error('이 SillyTavern 버전에서는 연결 프로필을 쓸 수 없습니다');
+        const profileId = c.stProfileId || '';
+        if (!profileId) throw new Error('ST 프로필이 선택되지 않았습니다 (확장 설정에서 선택하세요)');
+        const known = listStProfiles();
+        if (known.length && !known.some(pr => pr.id === profileId)) {
+            throw new Error('선택한 ST 프로필을 찾을 수 없습니다 (삭제되었거나 지원되지 않는 유형)');
+        }
+        // Chat-completion profiles take the messages as-is; text-completion ones
+        // need them flattened through the profile's instruct template first.
+        let payload = messages;
+        try { if (svc.constructPrompt) payload = svc.constructPrompt(messages, profileId); }
+        catch (e) { console.warn(`[${EXT}] constructPrompt failed, sending raw messages`, e); }
+        const data = await svc.sendRequest(profileId, payload, budgetFor(messages), {
+            stream: false,
+            extractData: true,
+            // The profile's completion preset supplies sampling; its instruct
+            // template is irrelevant to a chat-completion translation but is
+            // what makes text-completion profiles work, so leave both on.
+            includePreset: true,
+            includeInstruct: true,
+        });
+        const out = typeof data === 'string' ? data : (data?.content || '');
+        return (out || '').trim();
     }
 
-    const { provider:providerKey, params } = getCurrentParams();
-    const providerParams = getProviderSpecificParams(providerKey, params);
-    const parameters = { model, messages, stream:false, chat_completion_source:source, ...providerParams };
-    if (source==='vertexai') {
+    const prov = c.provider || 'openai';
+    const source = PROVIDER_TO_SOURCE[prov] || prov;
+    const model = (c.model === '__custom__' ? (c.customModelName || '') : (c.model || '')) || '';
+    const { params } = getCurrentParams();
+    const providerParams = getProviderSpecificParams(prov, params);
+    const parameters = { model, messages, stream: false, chat_completion_source: source, ...providerParams };
+    if (source === 'vertexai') {
         // Read Vertex auth mode and region from ST's main API settings (oai_settings).
         // Hardcoding 'full' breaks users whose ST is configured in 'express' mode,
         // and missing region/project_id causes 404 on certain models.
-        // Fallback to 'full' preserves the previous behaviour when settings are absent.
         parameters.vertexai_auth_mode = oai_settings?.vertexai_auth_mode || 'full';
         const region = oai_settings?.vertexai_region;
         if (region) parameters.vertexai_region = region;
@@ -370,26 +443,221 @@ Now output the above text translated into ${lang}.${nonce}`;
     }
     if (c.useReverseProxy && c.reverseProxyUrl?.trim()) {
         parameters.reverse_proxy = c.reverseProxyUrl.trim();
-        parameters.proxy_password = c.reverseProxyPassword||'';
+        parameters.proxy_password = c.reverseProxyPassword || '';
     }
-    if (extraNonce) {
-        parameters.top_p = Math.min(1,(params.top_p??1)*0.97);
-        if ('top_k' in providerParams) parameters.top_k = Math.max(1, params.top_k||40);
-    }
+    if (typeof tweak === 'function') tweak(parameters, params, providerParams);
 
     const res = await fetch('/api/backends/chat-completions/generate', {
-        method:'POST', headers:{...getRequestHeaders(),'Content-Type':'application/json'},
-        body:JSON.stringify(parameters),
+        method: 'POST', headers: { ...getRequestHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify(parameters),
     });
     if (!res.ok) {
-        let msg=`HTTP ${res.status}`;
-        try { const err=await res.json(); msg=err?.error?.message||err?.message||msg; } catch(e){}
+        let msg = `HTTP ${res.status}`;
+        try { const err = await res.json(); msg = err?.error?.message || err?.message || msg; } catch (e) {}
         throw new Error(msg);
     }
     const d = await res.json();
-    let result = d.choices?.[0]?.message?.content?.trim()
+    return (d.choices?.[0]?.message?.content?.trim()
         || d.content?.[0]?.text?.trim()
-        || d.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+        || d.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '').trim();
+}
+
+// Prefill rides as an assistant/model turn. A profile hides its source, so read
+// the role off the profile's api string instead.
+function prefillRole(source) {
+    const t = String(source || '').toLowerCase();
+    return (t.includes('makersuite') || t.includes('google') || t.includes('vertexai')) ? 'model' : 'assistant';
+}
+
+function buildMessages(prompt) {
+    const c = cfg();
+    const messages = [{ role: 'user', content: prompt }];
+    if (c.prefillEnabled && c.prefillText?.trim()) {
+        let src;
+        if (usingStProfile()) {
+            const pr = listStProfiles().find(x => x.id === c.stProfileId);
+            src = pr?.api || '';
+        } else {
+            src = PROVIDER_TO_SOURCE[c.provider || 'openai'] || c.provider;
+        }
+        messages.push({ role: prefillRole(src), content: c.prefillText.trim() });
+    }
+    return messages;
+}
+
+// ── Annotation ({{// ... }}) helpers ──────────────────────────────────
+// A block's stored translation always keeps the shape
+//     본문 번역 (없으면 원문)
+//     {{// ========
+//     [🌐내용 번역]
+//
+//     주석 번역
+//
+//     ========}}
+// so 본문 and 주석 can be produced by two separate runs (better model output
+// than asking for both at once) and still end up merged into one entry.
+const NOTE_RE = /\{\{\s*\/\/([\s\S]*?)\}\}/;
+
+// The 주석 block is fenced and labelled so it is easy to spot while scrolling a
+// long prompt. The label is always this exact Korean string, whatever language
+// the 주석 itself is translated into — it marks the block, it isn't content.
+const NOTE_LABEL = '[🌐내용 번역]';
+const NOTE_FENCE = '========';
+// Tolerated on read: the fence line, the label line (any [🌐...] variant), and
+// the closing fence. Notes stored by older versions had none of these and are
+// still parsed correctly, then re-fenced the next time the item is translated.
+const NOTE_OPEN_RE  = /^={3,}[ \t]*(?:\r?\n|$)/;
+const NOTE_LABEL_RE = /^[ \t]*\[🌐[^\]]*\][ \t]*(?:\r?\n|$)/;
+const NOTE_CLOSE_RE = /(?:\r?\n)?[ \t]*={3,}[ \t]*$/;
+
+// Global twin of NOTE_RE, for scanning every comment in a piece of source text.
+const NOTE_RE_G = /\{\{\s*\/\/([\s\S]*?)\}\}/g;
+// Presence of the 🌐 label is what makes a comment *ours*.
+const NOTE_MARK_RE = /\[🌐[^\]]*\]/;
+
+// Once a 주석 번역 has been applied to a preset/WI/card, the annotation lives in
+// the file itself. Re-loading that file later, the extension has to tell its own
+// annotation apart from a comment the author wrote by hand — otherwise it would
+// send its own Korean note back to the model as if it were source text, and
+// would have no way to know a 주석 already exists once the local cache is gone.
+// The fenced [🌐내용 번역] label is that marker: specific enough that no
+// hand-written {{// ... }} comment will collide with it.
+//
+// Returns { source, note } — source is the content with our block removed,
+// note is the annotation we recovered (or '' if the text holds none of ours).
+// Comments that are NOT ours are left in source untouched.
+function extractOwnNote(text) {
+    const t = typeof text === 'string' ? text : '';
+    if (!t || !NOTE_MARK_RE.test(t)) return { source: t, note: '' };
+    NOTE_RE_G.lastIndex = 0;
+    for (const m of t.matchAll(NOTE_RE_G)) {
+        if (!NOTE_MARK_RE.test(m[1] || '')) continue;   // someone else's comment
+        const note = unwrapNoteBody(m[1] || '');
+        const source = (t.slice(0, m.index) + t.slice(m.index + m[0].length)).trim();
+        return { source, note };
+    }
+    return { source: t, note: '' };
+}
+
+// Peel the fence/label decoration off a note's inner text.
+function unwrapNoteBody(inner) {
+    let t = (inner || '').trim();
+    t = t.replace(NOTE_OPEN_RE, '');
+    t = t.replace(NOTE_LABEL_RE, '');
+    t = t.replace(NOTE_CLOSE_RE, '');
+    return t.trim();
+}
+
+function wrapNote(note) {
+    return `{{// ${NOTE_FENCE}\n${NOTE_LABEL}\n\n${note}\n\n${NOTE_FENCE}}}`;
+}
+
+// Split a stored body part into its 본문 and 주석 halves.
+function splitBodyAndNote(bodyText) {
+    const t = typeof bodyText === 'string' ? bodyText : '';
+    const m = t.match(NOTE_RE);
+    if (!m) return { body: t.trim(), note: '' };
+    const note = unwrapNoteBody(m[1] || '');
+    const body = (t.slice(0, m.index) + t.slice(m.index + m[0].length)).trim();
+    return { body, note };
+}
+
+// Re-join 본문 + 주석 into the canonical stored shape.
+function joinBodyAndNote(body, note) {
+    const b = (body || '').trim();
+    const n = (note || '').trim();
+    if (b && n) return `${b}\n${wrapNote(n)}`;
+    if (n) return wrapNote(n);
+    return b;
+}
+
+// A 주석 lives inside {{// ... }}, so a {{macro}} in it would be terminated by the
+// macro's own "}}" — cutting the comment short and leaving half a macro exposed
+// to ST's parser. Rewrite every {{...}} inside a note as <...>: the shape asked
+// for, and inert to the macro engine.
+function sanitizeNoteMacros(text) {
+    let t = (text || '');
+    // Looped for nested macros like {{random::{{char}}}}; bounded so no input can
+    // spin here.
+    for (let i = 0; i < 5 && t.includes('{{'); i++) {
+        const next = t.replace(/\{\{([^{}]*)\}\}/g, '<$1>');
+        if (next === t) break;
+        t = next;
+    }
+    // Anything still unbalanced would break the comment just the same.
+    return t.replace(/\{\{/g, '<').replace(/\}\}/g, '>').trim();
+}
+
+// The model occasionally wraps its answer in {{// }} on its own when it can see
+// the annotation shape in context — unwrap it so we never nest the markers.
+function stripNoteWrapper(text) {
+    const t = (text || '').trim();
+    const m = t.match(/^\{\{\s*\/\/([\s\S]*)\}\}$/);
+    return unwrapNoteBody(m ? (m[1] || '') : t);
+}
+
+// ── Translation ─────────────────────────────────────────────────
+// opts:
+//   mode         'body' (default) → target language is 본문; 'note' → 주석 language.
+//                Only one of the two is requested per call, so the model never
+//                has to produce two different renderings in one response.
+//   includeTitle false → do not send/translate the title, because a 제목
+//                translation already exists and must be preserved.
+async function translateText(name, text, extraNonce, opts = {}) {
+    const mode         = opts.mode === 'note' ? 'note' : 'body';
+    const includeTitle = opts.includeTitle !== false;
+    const hasName    = includeTitle && !!(name && name.trim());
+    const hasContent = !!(text && text.trim());
+    // Nothing translatable at all → skip
+    if (!hasName && !hasContent) return '';
+    const c = cfg();
+    // 제목 always uses its own configured language, independently of whether this
+    // run is producing 본문 or 주석.
+    const titleLang = effLang('title');
+    const lang = hasContent ? (mode === 'note' ? effLang('note') : effLang()) : titleLang;
+    const dualLang = hasName && hasContent && titleLang !== lang;
+    const nonce = extraNonce ? `\n<!--retry:${extraNonce}-->` : '';
+    // Compose what we send to the model:
+    //   - name + content → "### {name}\n\n{content}"
+    //   - name only     → "### {name}"   (title-only translation)
+    //   - content only  → "{content}"
+    const combined = hasName && hasContent
+        ? `### ${name}\n\n${text}`
+        : (hasName ? `### ${name}` : text);
+
+    // 주석은 {{// ... }} 안에 들어가므로 중괄호 매크로를 그대로 두면 주석이 잘린다.
+    const noteRule = mode === 'note'
+        ? `\n8. This text will be placed inside an inline annotation. Rule 2 still holds — do not translate a macro's contents — but write every macro in ANGLE brackets instead of curly braces: {{char}} → <char>, {{user}} → <user>, {{getvar::x}} → <getvar::x>. Never emit "{{" or "}}".`
+        : '';
+    const titleRule = dualLang
+        ? `\n0. The first line starts with "### " — that is a TITLE. Translate the title text into ${titleLang} (keep the "### " prefix), and translate everything after it into ${lang}. The two target languages are intentional; do not unify them.`
+        : '';
+    const headline = dualLang
+        ? `Translate the following text: the "### " title line into ${titleLang}, and everything after it into ${lang}.`
+        : `Translate the following text into ${lang}.`;
+
+    const prompt =
+`${headline}
+
+RULES:${titleRule}
+1. Translate ALL human-readable text including headings, labels, titles, and body content.
+2. Do NOT translate: HTML/XML tags, {{char}}, {{user}}, {{getvar::*}}, {{setvar::*}}, {{random::*}}, regex patterns, JSON keys, code, URLs, emoji.
+3. Do NOT alter references to languages, nationalities, cultures, or styles. For example: if the source says "Chinese style" or "中文风格" or "중국식", translate those words literally — do NOT replace them with the target language name.
+4. Preserve all markdown, whitespace, indentation, and line breaks exactly.
+5. Output ONLY the translated text — no preamble, no "Here is:", no meta-commentary.
+6. Never echo the source text back unchanged. Even if the source is already close to ${lang}, produce a proper ${lang} rendering.
+7. If a line starts with "**Keys:**" or "**Filters:**", keep that exact prefix and the comma-separated list format, and keep it on its own line at the top. Translate each item into ${lang}. These are trigger keywords, so render them as the natural word a reader would actually type, not as a literal gloss.${noteRule}
+
+--- SOURCE ---
+${combined}
+--- END ---
+
+Now output the above text translated${dualLang ? ` (title into ${titleLang}, the rest into ${lang})` : ` into ${lang}`}.${nonce}`;
+
+    let result = await runCompletion(buildMessages(prompt), extraNonce ? (par, params, provParams) => {
+        par.top_p = Math.min(1, (params.top_p ?? 1) * 0.97);
+        if ('top_k' in provParams) par.top_k = Math.max(1, params.top_k || 40);
+    } : null);
     result = result.replace(/^---\s*SOURCE\s*---\s*\n?/i,'').replace(/\n?---\s*END\s*---\s*$/i,'').trim();
     return result;
 }
@@ -423,8 +691,173 @@ function readPresetBlocks(presetName) {
             const p=map[entry.identifier]; if(!p) continue;
             blocks.push({ id:p.identifier, name:p.name||p.identifier, enabled:entry.enabled!==false, content:p.content||'', isCustom:!systemIds.has(p.identifier) });
         }
+
+        // Preset-scoped regex scripts (preset.extensions.regex_scripts).
+        // These are listed so their *names* can be translated — the pattern and
+        // the replacement are code, and translating either would break the
+        // script, so they are shown read-only and marked titleOnly, which keeps
+        // them out of the full-body translation run entirely.
+        const rx = preset.extensions?.regex_scripts;
+        if (Array.isArray(rx)) {
+            rx.forEach((r, i) => {
+                if (!r) return;
+                blocks.push({
+                    id: regexBlockId(r, i),
+                    name: String(r.scriptName || `Regex ${i + 1}`),
+                    enabled: !r.disabled,
+                    // The pattern and the replacement are never surfaced: they
+                    // are code, they must not be translated, and showing them
+                    // only invites someone to try. Only the name is in play.
+                    content: '',
+                    isRegex: true,
+                    titleOnly: true,
+                });
+            });
+        }
+
+        // ST-BaiBai-Tools 그룹(폴더) 이름.
+        readPresetGroups(preset).forEach((g, i) => {
+            if (!g || !g.name) return;
+            blocks.push({
+                id: `${GROUP_ID_PREFIX}${g.id || i}`,
+                name: String(g.name),
+                enabled: g.enabled !== false,
+                content: '',
+                isGroup: true,
+                titleOnly: true,
+            });
+        });
+
+        // JS러너(酒馆助手) 폴더/스크립트 이름. 코드(content)는 노출하지 않는다.
+        readTavernHelperNodes(preset).forEach(({ node, depth, index }) => {
+            if (!node.name) return;
+            const isFolder = node.type === 'folder' || Array.isArray(node.scripts);
+            blocks.push({
+                id: `${THS_ID_PREFIX}${node.id || `${depth}-${index}`}`,
+                name: String(node.name),
+                enabled: String(node.enabled) !== 'false',
+                content: '',
+                isRunner: true,
+                isRunnerFolder: isFolder,
+                titleOnly: true,
+            });
+        });
     } catch(e) { console.warn(`[${EXT}]`,e); }
     return blocks;
+}
+
+// Cache id for a preset regex script. Uses the script's own UUID when it has
+// one so the cached translation survives reordering; falls back to position.
+const REGEX_ID_PREFIX = '__pp_regex__::';
+const regexBlockId = (script, index) => `${REGEX_ID_PREFIX}${script?.id || index}`;
+
+// ── Third-party title sources living inside the preset ────────────────
+// Both are other extensions' data that happens to ride along in the preset
+// file, and both are label-only: their payload is code or layout state, so
+// they are read as titleOnly blocks exactly like regex scripts.
+const GROUP_ID_PREFIX = '__grp::';
+const THS_ID_PREFIX   = '__ths::';
+
+// ST-BaiBai-Tools (柏宝箱) prompt grouping. Current path is
+// extensions.baibaiToolkit.presetPromptGroups; extensions.entryGrouping is the
+// older layout it still reads as a fallback, so accept both.
+function readPresetGroups(preset) {
+    const ext = preset?.extensions;
+    if (!ext || typeof ext !== 'object') return [];
+    const candidates = [ext.baibaiToolkit?.presetPromptGroups, ext.entryGrouping];
+    for (const c of candidates) {
+        const groups = Array.isArray(c) ? c : (Array.isArray(c?.groups) ? c.groups : null);
+        if (groups?.length) return groups;
+    }
+    return [];
+}
+
+// JS-Slash-Runner (酒馆助手) preset-bound scripts. `scripts` is a tree: folders
+// carry type 'folder' and nest more entries under their own `scripts`. Folder
+// names and script names are both translatable; `content` is JavaScript and is
+// never surfaced.
+function walkTavernHelper(nodes, visit, depth = 0, out = []) {
+    if (!Array.isArray(nodes) || depth > 6) return out;
+    nodes.forEach((node, i) => {
+        if (!node || typeof node !== 'object') return;
+        visit(node, i, depth, out);
+        walkTavernHelper(node.scripts, visit, depth + 1, out);
+    });
+    return out;
+}
+
+function readTavernHelperNodes(preset) {
+    const scripts = preset?.extensions?.tavern_helper?.scripts;
+    return walkTavernHelper(scripts, (node, i, depth, out) => {
+        out.push({ node, depth, index: i });
+    });
+}
+
+// 酒馆助手(JS-Slash-Runner) keeps preset scripts in its own Pinia store, loaded
+// once and only re-read when the preset NAME changes — so reopening its script
+// list re-renders the same stale copy and our new names never show. It does
+// expose a public API on globalThis.TavernHelper, and writing through that
+// updates the store (UI reacts immediately) and lets the extension persist the
+// change itself. Only valid for the currently selected preset, which is the
+// only one its store is bound to.
+//
+// Returns true if the handoff happened. Best-effort by design: this is another
+// extension's API, so any failure must leave our own save untouched.
+function pushRunnerTitlesToTavernHelper(ns) {
+    const th = (typeof PAR !== 'undefined' && PAR?.TavernHelper) || globalThis.TavernHelper;
+    if (typeof th?.updateScriptTreesWith !== 'function') return false;
+    try {
+        let renamed = 0;
+        th.updateScriptTreesWith(trees => {
+            walkTavernHelper(trees, (node, i, depth) => {
+                const title = getTranslatedTitle(ns, `${THS_ID_PREFIX}${node.id || `${depth}-${i}`}`);
+                if (title && node.name !== title) { node.name = title; renamed++; }
+            });
+            return trees;
+        }, { type: 'preset' });
+        return renamed > 0;
+    } catch (e) {
+        console.warn(`[${EXT}] TavernHelper script rename failed`, e);
+        return false;
+    }
+}
+
+// Writes translated group names back onto a preset, in place. Only `name` is
+// touched — id/order/collapsed/enabled decide layout and must survive.
+function applyPresetGroupTitles(presetObj, ns) {
+    let n = 0;
+    readPresetGroups(presetObj).forEach((g, i) => {
+        if (!g) return;
+        const title = getTranslatedTitle(ns, `${GROUP_ID_PREFIX}${g.id || i}`);
+        if (title) { g.name = title; n++; }
+    });
+    return n;
+}
+
+// Writes translated names onto the JS-Runner folder/script tree, in place.
+// `content` (the script source) is never read or written here.
+function applyPresetRunnerTitles(presetObj, ns) {
+    let n = 0;
+    readTavernHelperNodes(presetObj).forEach(({ node, depth, index }) => {
+        const title = getTranslatedTitle(ns, `${THS_ID_PREFIX}${node.id || `${depth}-${index}`}`);
+        if (title) { node.name = title; n++; }
+    });
+    return n;
+}
+
+// Writes translated names back onto a preset's regex scripts, in place.
+// Title only — findRegex/replaceString are never touched.
+// Returns the number of scripts renamed.
+function applyPresetRegexTitles(presetObj, ns) {
+    const rx = presetObj?.extensions?.regex_scripts;
+    if (!Array.isArray(rx)) return 0;
+    let n = 0;
+    rx.forEach((r, i) => {
+        if (!r) return;
+        const title = getTranslatedTitle(ns, regexBlockId(r, i));
+        if (title) { r.scriptName = title; n++; }
+    });
+    return n;
 }
 
 // ── World Info ────────────────────────────────────────────────────────
@@ -606,17 +1039,35 @@ function highlightText(html, keyword) {
     return html.replace(new RegExp(`(${safeK})`, 'gi'), '<mark class="pt-highlight">$1</mark>');
 }
 
-function makeBlockItem(block, ns, selectable) {
+function makeBlockItem(block, ns, selectable, onEdited) {
     const el = PDOC.createElement('div');
     el.className = 'pt-block-item';
     el.dataset.id = block.id;
-    const cached = getCached(ns, block.id);
+    // Title-only blocks (preset regex scripts) never hold a body translation,
+    // so their "번역" box shows the translated name instead — otherwise there
+    // would be nothing to see there at all.
+    // A note recovered from the file (cache lost / different device) is real
+    // translated content, so show it rather than claiming 번역 전.
+    const cached = block.titleOnly
+        ? getCachedTitle(ns, block.id)
+        : (getCached(ns, block.id)
+            ?? (block.injectedNote ? joinBodyAndNote(block.content || '', block.injectedNote) : null));
     const tokens = estimateTokens(block.content||'');
     el.dataset.searchText = (block.name+' '+(block.content||'')+' '+(cached||'')).toLowerCase();
 
     // Use ST native FA link icon
     const clipBadge = block.isCustom
         ? `<span class="pt-clip-badge"><i class="fa-solid fa-link"></i></span>` : '';
+
+    // Preset regex script: name is translatable, body is code (read-only).
+    const regexBadge = block.isRegex
+        ? `<span class="pt-clip-badge" title="프리셋 정규식 — 제목만 번역됩니다"><i class="fa-solid fa-code"></i></span>` : '';
+
+    // Other extensions' labels that live in the preset — same title-only rule.
+    const groupBadge = block.isGroup
+        ? `<span class="pt-clip-badge" title="프롬프트 그룹 (ST-BaiBai-Tools) — 제목만 번역됩니다"><i class="fa-solid fa-folder"></i></span>` : '';
+    const runnerBadge = block.isRunner
+        ? `<span class="pt-clip-badge" title="${block.isRunnerFolder ? 'JS러너 폴더' : 'JS러너 스크립트'} — 제목만 번역됩니다"><i class="fa-solid fa-${block.isRunnerFolder ? 'folder-tree' : 'scroll'}"></i></span>` : '';
 
     // Character cards: no ON/OFF badge
     const statusBadge = block.isChar
@@ -644,21 +1095,100 @@ function makeBlockItem(block, ns, selectable) {
             ${checkboxHtml}
             ${statusBadge}
             <span class="pt-block-name" title="${esc(block.name)}">${esc(block.name)}</span>
-            ${clipBadge}
+            ${clipBadge}${regexBadge}${groupBadge}${runnerBadge}
             <span class="pt-token-count">${tokens}</span>
             <span class="pt-block-chevron">▶</span>
         </div>
         <div class="pt-block-body">
             ${metaHtml}
-            <div class="pt-original-label">원문</div>
-            <div class="pt-original-text">${esc(block.content||'')}</div>
-            <div class="pt-translated-label">번역</div>
+            ${block.titleOnly ? '' : `<div class="pt-original-label">원문</div>
+            <div class="pt-original-text">${esc(block.content||'')}</div>`}
+            <div class="pt-translated-label">${block.titleOnly ? '번역된 제목' : '번역'} <button type="button" class="pt-edit-btn" title="번역 직접 수정"><i class="fa-solid fa-pen"></i></button></div>
             <div class="pt-translated-text">${cached?esc(cached):'<span class="pt-no-trans">번역 전</span>'}</div>
         </div>`;
 
     el.querySelector('.pt-block-header').addEventListener('click', e => {
         if (e.target.classList.contains('pt-checkbox')) return;
         el.classList.toggle('expanded');
+    });
+
+    // ── Direct edit: let the person hand-fix a translated title/body ────
+    // instead of re-running the model. Stored back through the exact same
+    // "### {title}\n\n{body}" shape a real translation produces, so every
+    // reader of the cache (JSON export, TM export, 👀 title mode, etc.)
+    // treats a manual edit identically to a model translation.
+    const trTextEl = el.querySelector('.pt-translated-text');
+    const closeEditForm = () => {
+        const form = el.querySelector('.pt-edit-form');
+        if (form) form.remove();
+        trTextEl.style.display = '';
+    };
+    el.querySelector('.pt-edit-btn')?.addEventListener('click', e => {
+        e.stopPropagation();
+        if (el.querySelector('.pt-edit-form')) { closeEditForm(); return; } // already open → toggle closed
+        const id = block.id;
+        const cachedNow = getCached(ns, id);
+        const parsed = splitTitleAndBody(cachedNow || '');
+        const titleCached = getCachedTitle(ns, id);
+        const curTitle = (titleCached && titleCached.trim()) ? titleCached.trim() : (parsed.title || '');
+        const curBody  = parsed.title ? parsed.body : (cachedNow || '');
+
+        const form = PDOC.createElement('div');
+        form.className = 'pt-edit-form';
+        // Title-only blocks (preset regex scripts): no body field at all — the
+        // body is a regex pattern and must stay exactly as written.
+        const bodyFieldHtml = block.titleOnly ? '' : `
+            <div class="pt-edit-label">본문 (번역)</div>
+            <textarea class="pt-edit-body text_pole" rows="6" placeholder="번역된 본문">${esc(curBody)}</textarea>`;
+        form.innerHTML = `
+            <div class="pt-edit-label">제목 (번역, 비워두면 원래 이름 사용)</div>
+            <input type="text" class="pt-edit-title text_pole" value="${esc(curTitle)}" placeholder="번역된 제목">
+            ${bodyFieldHtml}
+            <div class="pt-edit-actions">
+                <button type="button" class="pt-btn pt-btn-primary pt-edit-save">저장</button>
+                <button type="button" class="pt-btn pt-btn-secondary pt-edit-cancel">취소</button>
+            </div>`;
+        trTextEl.insertAdjacentElement('afterend', form);
+        trTextEl.style.display = 'none';
+        form.addEventListener('click', ev => ev.stopPropagation());
+
+        form.querySelector('.pt-edit-cancel').addEventListener('click', () => closeEditForm());
+        form.querySelector('.pt-edit-save').addEventListener('click', () => {
+            const newTitle = form.querySelector('.pt-edit-title').value.trim();
+            const newBody  = form.querySelector('.pt-edit-body')?.value.trim() || '';
+
+            if (block.titleOnly) {
+                // Only the title cache is ever written for these, so a full
+                // translation can never sneak a body in behind them.
+                if (!newTitle) {
+                    clearNS(ns, [id]);
+                    trTextEl.innerHTML = '<span class="pt-no-trans">번역 전</span>';
+                } else {
+                    setCacheTitle(ns, id, newTitle);
+                    trTextEl.innerHTML = esc(newTitle);
+                }
+            } else if (!newTitle && !newBody) {
+                // Both cleared → wipe this item's translation entirely.
+                clearNS(ns, [id]);
+                trTextEl.innerHTML = '<span class="pt-no-trans">번역 전</span>';
+            } else {
+                const combined = newTitle ? `### ${newTitle}\n\n${newBody}` : newBody;
+                setCache(ns, id, combined);
+                clearCachedTitle(ns, id); // full translation now wins over any stale title-only entry
+                trTextEl.innerHTML = esc(combined);
+            }
+            closeEditForm();
+
+            // Keep the search index in sync (same fields setBlockHTML() indexes).
+            const namePart = el.dataset.origName || el.querySelector('.pt-block-name')?.textContent || '';
+            const origPart = el.querySelector('.pt-original-text')?.textContent || '';
+            const transPart = trTextEl.textContent || '';
+            el.dataset.searchText = (namePart+' '+origPart+' '+transPart).toLowerCase();
+
+            try { updateCacheStatsUI(); } catch(e) {}
+            if (typeof onEdited === 'function') onEdited(id);
+            if (typeof toastr !== 'undefined') toastr.success('번역이 저장되었습니다');
+        });
     });
     if (selectable) {
         el.querySelector('.pt-checkbox')?.addEventListener('change', ev => {
@@ -706,40 +1236,91 @@ function setBlockHTML(list, id, htmlContent) {
 }
 
 // ── Translation runner ─────────────────────────────────────────────────
-async function runTranslation({ items, list, ns, pBar, pLabel, pWrap, btnStop, forceRetranslate }) {
+// mode: 'body' → the translation replaces 본문; 'note' → it is stored as the
+// {{// ... }} 주석 instead. A run only ever produces one of the two; whichever
+// half already exists is carried over untouched, so running both modes in turn
+// merges into the canonical "본문\n{{// 주석}}" shape.
+async function runTranslation({ items, list, ns, pBar, pLabel, pWrap, btnStop, forceRetranslate, mode }) {
     if (isBusy) return;
+    const runMode = mode === 'note' ? 'note' : 'body';
+
+    const selected=[...list.querySelectorAll('.pt-block-item.selected')].map(el=>el.dataset.id);
+    const scoped=selected.length?items.filter(b=>selected.includes(b.id)):items;
+    // titleOnly items (preset regex scripts) carry a regex pattern as their
+    // body — translating it would break the script, so they are never part of
+    // a full-body run. Their names are handled by 📛 제목 instead.
+    const targets=scoped.filter(b=>!b.titleOnly);
+    const skipped=scoped.length-targets.length;
+    if (!targets.length) {
+        if (typeof toastr!=='undefined') {
+            toastr.info(skipped
+                ? '정규식 · 그룹 · JS러너 항목은 📛 제목 버튼으로만 번역됩니다'
+                : '번역할 항목이 없습니다');
+        }
+        return;
+    }
+
     isBusy=true; stopReq=false;
     const dot=PDOC.getElementById('pt-status-dot'), stTxt=PDOC.getElementById('pt-status-text');
     dot?.classList.add('busy');
-    if (stTxt) stTxt.textContent = forceRetranslate?'재번역 중...':'번역 중...';
+    const modeLabel = runMode === 'note' ? '주석' : '번역';
+    if (stTxt) stTxt.textContent = forceRetranslate?`${modeLabel} 재번역 중...`:`${modeLabel} 중...`;
     pWrap.classList.add('visible');
     if (btnStop) btnStop.disabled=false;
 
-    const selected=[...list.querySelectorAll('.pt-block-item.selected')].map(el=>el.dataset.id);
-    const targets=selected.length?items.filter(b=>selected.includes(b.id)):items;
     const total=targets.length; let done=0;
 
     for (const b of targets) {
         if (stopReq) break;
-        if (forceRetranslate) {
-            const key = ck(ns, b.id);
-            translationMap.delete(key);
-            dbDelete(key);
-        }
-        const cached=forceRetranslate?null:getCached(ns,b.id);
-        if (cached) {
-            setBlockHTML(list,b.id,esc(cached));
+        // Read the existing entry first: the half this run is NOT producing has
+        // to survive, and forceRetranslate must only redo the half it targets.
+        const prevFull  = getCached(ns, b.id);
+        const prevSplit = prevFull ? splitTitleAndBody(prevFull) : { title:null, body:'' };
+        const prevParts = splitBodyAndNote(prevSplit.body);
+        // 제목 번역이 이미 존재하면 본문만 번역한다. 없을 때에만 제목을 함께
+        // 번역하며, 그 경우에도 제목은 패널의 제목 언어 설정을 따른다.
+        const existingTitle = getTranslatedTitle(ns, b.id);
+        const includeTitle  = !existingTitle;
+        const sentTitle     = includeTitle && !!(b.name && b.name.trim());
+        // 주석만 번역한 항목은 본문 자리에 원문을 그대로 둔다. 그 원문은 "번역된
+        // 본문"이 아니므로, 나중에 완전 번역을 돌릴 때 이미 번역된 것으로 오인해
+        // 건너뛰면 안 된다 — 원문과 글자 그대로 같은지로 구분한다.
+        const origBody      = (b.content || '').trim();
+        const bodyIsOrig    = !!prevParts.body && prevParts.body === origBody;
+        const haveBody      = !!prevParts.body && !bodyIsOrig;
+        // 캐시에 주석이 없더라도, 파일에 이미 적용돼 있던 주석(로드 때 원문에서
+        // 떼어낸 것)을 존재하는 주석으로 인정하고 그대로 보존한다.
+        const prevNote      = prevParts.note || (b.injectedNote || '');
+        const havePart = runMode === 'note' ? !!prevNote : haveBody;
+
+        if (!forceRetranslate && havePart) {
+            setBlockHTML(list,b.id,esc(prevFull));
         } else {
-            setBlockHTML(list,b.id,'<span class="pt-translating">⟳ 번역 중...</span>');
+            setBlockHTML(list,b.id,`<span class="pt-translating">⟳ ${modeLabel} 중...</span>`);
             try {
                 const nonce=forceRetranslate?Math.random().toString(36).slice(2,10):null;
-                const res=await translateText(b.name,b.content,nonce);
+                const res=await translateText(b.name,b.content,nonce,{ mode:runMode, includeTitle });
                 if (res) {
-                    setBlockHTML(list,b.id,esc(res));
-                    setCache(ns,b.id,res);
-                    // Full translation is the newer action — retire the
-                    // title-only entry so its title isn't stuck winning.
-                    clearCachedTitle(ns,b.id);
+                    let newTitle = existingTitle || '';
+                    let part = res;
+                    if (sentTitle) {
+                        const sp = splitTitleAndBody(res);
+                        if (sp.title) { newTitle = sp.title; part = sp.body; }
+                    }
+                    part = (part || '').trim();
+                    const bodyPart = runMode === 'note'
+                        // 완전 번역이 아직 없으면 원문을 본문 자리에 남겨 둔다:
+                        //   원문
+                        //   {{// 주석}}
+                        ? joinBodyAndNote(haveBody ? prevParts.body : origBody,
+                                          sanitizeNoteMacros(stripNoteWrapper(part)))
+                        : joinBodyAndNote(part, prevNote);
+                    const combined = newTitle ? `### ${newTitle}\n\n${bodyPart}` : bodyPart;
+                    setBlockHTML(list,b.id,esc(combined));
+                    setCache(ns,b.id,combined);
+                    // A freshly translated title becomes the authoritative one;
+                    // an existing 제목 번역 is left exactly as it was.
+                    if (sentTitle && newTitle) setCacheTitle(ns,b.id,newTitle);
                 } else {
                     // Both name and content were empty — nothing to translate
                     setBlockHTML(list,b.id,'<span class="pt-no-trans">번역 전</span>');
@@ -758,10 +1339,13 @@ async function runTranslation({ items, list, ns, pBar, pLabel, pWrap, btnStop, f
     try { updateCacheStatsUI(); } catch(e) {}
     isBusy=false;
     dot?.classList.remove('busy');
-    if (stTxt) stTxt.textContent=stopReq?'중단됨':(forceRetranslate?'재번역 완료 ✓':'번역 완료 ✓');
+    if (stTxt) stTxt.textContent=stopReq?'중단됨':(forceRetranslate?`${modeLabel} 재번역 완료 ✓`:`${modeLabel} 완료 ✓`);
     pWrap.classList.remove('visible');
     if (btnStop) btnStop.disabled=true;
     setTimeout(()=>{const t=PDOC.getElementById('pt-status-text');if(t)t.textContent='대기 중';},3000);
+    if (skipped && typeof toastr!=='undefined') {
+        toastr.info(`제목 전용 항목 ${skipped}개는 본문 번역에서 제외됨 (📛 제목으로 이름만 번역 가능)`);
+    }
 }
 
 // ── Export Module (Plus) ────────────────────────────────────
@@ -769,8 +1353,8 @@ async function runTranslation({ items, list, ns, pBar, pLabel, pWrap, btnStop, f
 // Sanitize filename: remove forbidden chars but keep unicode (Korean/Chinese OK)
 function sanitizeFilename(name) {
     return String(name || 'untitled')
-        .replace(/[\/\\:*?"<>|]+/g, '_')
-        .replace(/\s+/g, '_')
+        .replace(/[\/\\:*?"<>|]+/g, ' ')
+        .replace(/\s+/g, ' ')
         .slice(0, 80);
 }
 
@@ -852,21 +1436,32 @@ function askTextChoice(title) {
     });
 }
 
-// Format text for export/copy according to choice
+// Format text for export/copy according to choice.
+// A translated title can exist even when the body was never fully
+// translated (the "제목만" action caches only a title) — getTranslatedTitle()
+// covers both that case and a title embedded in a full translation, so pull
+// it in separately instead of only reading the full-translation cache.
 function formatItemsAsText(items, choice) {
     const out = [];
     for (const it of items) {
-        const original   = (it.content || '').trim();
-        const translated = (getCached(it._ns, it.id) || '').trim();
-        const name = it.name || it.id || '';
+        const original     = (it.content || '').trim();
+        const name          = it.name || it.id || '';
+        const full          = getCached(it._ns, it.id);
+        const bodyTranslated = full ? splitTitleAndBody(full).body.trim() : '';
+        const titleRaw      = getTranslatedTitle(it._ns, it.id);
+        const hasTitle      = !!(titleRaw && titleRaw.trim() && titleRaw.trim() !== name.trim());
+        const titleTranslated = hasTitle ? titleRaw.trim() : '';
 
         if (choice === 'original') {
             out.push(`━━━ ${name} ━━━\n${original}`);
         } else if (choice === 'translated') {
-            out.push(`━━━ ${name} ━━━\n${translated || '(번역없음)'}`);
+            const header = titleTranslated ? `${titleTranslated} (${name})` : name;
+            const body   = bodyTranslated || (titleTranslated ? '(본문 번역 없음 — 제목만 번역됨)' : '(번역없음)');
+            out.push(`━━━ ${header} ━━━\n${body}`);
         } else { // both
-            const t = translated || '(번역없음)';
-            out.push(`━━━ ${name} ━━━\n[원문]\n${original}\n\n[번역]\n${t}`);
+            const header = titleTranslated ? `${titleTranslated} (${name})` : name;
+            const body   = bodyTranslated || (titleTranslated ? '(본문 번역 없음 — 제목만 번역됨)' : '(번역없음)');
+            out.push(`━━━ ${header} ━━━\n[원문]\n${original}\n\n[번역]\n${body}`);
         }
     }
     return out.join('\n\n');
@@ -1230,6 +1825,9 @@ function exportTitleScript(kind, srcName, items, ns) {
     const mapping = {};
     let skipped = 0;
     for (const b of (items || [])) {
+        // Preset regex scripts aren't prompt-manager entries, so their names
+        // would never match anything the generated script rewrites.
+        if (b.titleOnly) continue;
         const original = (b.name || '').trim();
         if (!original) continue;
         const translated = getTranslatedTitle(ns, b.id);
@@ -1257,14 +1855,14 @@ function exportTitleScript(kind, srcName, items, ns) {
         name: `(제목번역) ${label}`,
         id: uuid,
         content,
-        info: `Prompt Panel이 생성한 제목 번역 스크립트 (${count}개 항목, ${effLang()})`,
+        info: `Prompt Panel이 생성한 제목 번역 스크립트 (${count}개 항목, ${effLang('title')})`,
         button: { enabled: true, buttons: [] },
         data: {},
     };
 
     return {
         data,
-        filename: `${sanitizeFilename(label)}_titles_${effLang()}_jsrunner.json`,
+        filename: `${sanitizeFilename(label)}_titles_${effLang('title')}_jsrunner.json`,
         count,
         skipped,
     };
@@ -1332,7 +1930,221 @@ function exportPresetJSON(presetName) {
             if (typeof body === 'string') p.content = body;
         }
     }
+
+    // Preset-scoped regex scripts: translated names only.
+    applyPresetRegexTitles(cloned, ns);
+    // Third-party label sources that ride along in the preset.
+    applyPresetGroupTitles(cloned, ns);
+    applyPresetRunnerTitles(cloned, ns);
+
     return { data: cloned, filename: `${sanitizeFilename(targetName)}_${effLang()}.json` };
+}
+
+// ── Live Apply: Preset ──────────────────────────────────────────────
+// Writes cached translations straight into ST's own preset object (the
+// live `oai_settings` when the target preset is the one currently loaded,
+// otherwise the stored-but-inactive `openai_settings[idx]` object) and
+// persists it through the same '/api/presets/save' endpoint ST's own
+// "update preset" button uses — no JSON file to download/re-import.
+// Always applies to ALL prompts (matches exportPresetJSON: full export/apply
+// only, to keep preset structure intact).
+// titlesOnly: write only the translated names, leaving every prompt's content
+// as the original. That keeps the preset's source text intact, so the panel (and
+// a TM file) can still match it later by original content — a full apply
+// replaces the content and makes the item unmatchable from then on.
+async function applyPresetLive(presetName, titlesOnly) {
+    const targetName = presetName === '__cur__' || !presetName
+        ? (oai_settings?.preset_settings_openai || '')
+        : presetName;
+    if (!targetName) throw new Error('프리셋을 찾을 수 없습니다');
+    if (typeof getChatCompletionPreset !== 'function') {
+        throw new Error('프리셋 저장 함수를 찾을 수 없습니다 (ST 버전이 호환되지 않을 수 있습니다)');
+    }
+
+    const cur = getCurrentPresetName();
+    const isCurrent = targetName === cur;
+    let presetObj;
+    if (isCurrent) {
+        presetObj = oai_settings;
+    } else {
+        const presetIndex = openai_setting_names?.[targetName];
+        presetObj = presetIndex !== undefined ? openai_settings[presetIndex] : null;
+    }
+    if (!presetObj) throw new Error('프리셋 객체를 찾을 수 없습니다');
+
+    // Same ns readPresetBlocks()/exportPresetJSON() use, so this picks up
+    // whatever was already translated in the panel for this preset.
+    const ns = `pt-preset::${presetName || '__cur__'}`;
+    let applied = 0;
+    if (Array.isArray(presetObj.prompts)) {
+        for (const p of presetObj.prompts) {
+            if (!p || !p.identifier) continue;
+            const cached = getTranslated(ns, p.identifier);
+            const title = getTranslatedTitle(ns, p.identifier);
+            if (title) { p.name = title; applied++; }
+            if (titlesOnly || !cached) continue;
+            const { body } = splitTitleAndBody(cached);
+            if (typeof body === 'string') { p.content = body; applied++; }
+        }
+    }
+
+    // Preset-scoped regex scripts: rename only. `extensions` is part of
+    // settingsToUpdate, so getChatCompletionPreset() below carries this along.
+    const regexRenamed = applyPresetRegexTitles(presetObj, ns);
+    applied += regexRenamed;
+
+    // ST-BaiBai-Tools 그룹명 / JS러너 스크립트·폴더명. 같은 extensions 안에 있어
+    // 저장 경로는 동일하다.
+    //
+    // 그룹명은 한 가지를 더 해줘야 한다. ST-BaiBai-Tools는 "현재 선택된"
+    // 프리셋의 그룹 상태를 자체 메모리에 들고 있고, 그 캐시는 프리셋 이름이
+    // 바뀔 때만 파일에서 다시 읽는다. 그리고 그룹 조작이 있을 때마다 그 캐시를
+    // 프리셋에 되쓰기 때문에, 우리가 넣은 번역명이 원래 이름으로 되돌아간다.
+    // (프리셋을 떠났다 돌아와도 소용없다 — 떠나는 시점에 낡은 캐시가 먼저
+    //  파일로 flush되기 때문이다.) 저장 후 캐시를 강제로 버리게 만든다.
+    const groupRenamed  = applyPresetGroupTitles(presetObj, ns);
+    const runnerRenamed = applyPresetRunnerTitles(presetObj, ns);
+    applied += groupRenamed + runnerRenamed;
+
+    if (!applied) throw new Error(titlesOnly
+        ? '적용할 제목 번역이 없습니다. 먼저 📛 제목 번역을 실행하세요.'
+        : '적용할 번역이 없습니다. 먼저 번역을 실행하세요.');
+
+    // getChatCompletionPreset() pulls the full field set (all of
+    // settingsToUpdate, including prompts/prompt_order) off the object we
+    // just edited — this is exactly what ST's own save button sends, so
+    // nothing else in the preset gets clobbered.
+    const presetBody = getChatCompletionPreset(presetObj);
+
+    // Save through ST's own PresetManager rather than POSTing to /api/presets/save
+    // ourselves. Both write the same file, but savePreset() also calls
+    // updateList(), which refreshes ST's in-memory preset array (openai_settings).
+    // Skipping that left the file and ST's memory disagreeing, and other
+    // extensions read that array: 酒馆助手(JS-Slash-Runner) rebuilds the whole
+    // preset from `preset_list.presets[idx]` on its own debounced save, so a
+    // stale entry there would silently write our applied names back out.
+    const presetManager = SillyTavern?.getContext?.()?.getPresetManager?.('openai');
+    if (presetManager?.savePreset) {
+        await presetManager.savePreset(targetName, presetBody);
+    } else {
+        // Older ST without an exposed PresetManager — fall back to the raw call.
+        const res = await fetch('/api/presets/save', {
+            method: 'POST',
+            headers: { ...getRequestHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ apiId: 'openai', name: targetName, preset: presetBody }),
+        });
+        if (!res.ok) throw new Error(`저장 실패 (HTTP ${res.status})`);
+        // Keep ST's in-memory copy in step with what we just wrote.
+        try {
+            const idx = openai_setting_names?.[targetName];
+            if (idx !== undefined && Array.isArray(openai_settings)) openai_settings[idx] = presetBody;
+        } catch (e) { console.warn(`[${EXT}] preset list sync failed`, e); }
+    }
+
+    // Make ST-BaiBai-Tools drop its cached group state so it re-reads the names
+    // we just saved. OAI_PRESET_IMPORT_READY is the one public event whose
+    // handler calls resetPresetPromptGroupRuntimeState(); we deliberately send
+    // NO `data`, which is what keeps its two side effects from firing:
+    //   collapseImportedPresetPromptGroups(undefined) → bails on !Array.isArray
+    //     (so groups are not all collapsed shut)
+    //   importRegexPresetGroupStateFromPresetData(undefined) → bails on !presetData
+    // Only the cache reset is left. Best-effort: this is another extension's
+    // internal behaviour, so a failure here must never fail the apply itself.
+    // 酒馆助手 store handoff — see pushRunnerTitlesToTavernHelper(). Runs after the
+    // save so its own debounced write rebuilds from a preset list we already
+    // refreshed above, not from a stale entry.
+    let runnerLiveUpdated = false;
+    if (isCurrent && runnerRenamed > 0) {
+        runnerLiveUpdated = pushRunnerTitlesToTavernHelper(ns);
+    }
+
+    let groupReloadFailed = false;
+    if (isCurrent && groupRenamed > 0) {
+        try {
+            if (eventSource?.emit && event_types?.OAI_PRESET_IMPORT_READY) {
+                await eventSource.emit(event_types.OAI_PRESET_IMPORT_READY, { presetName: targetName });
+            } else {
+                groupReloadFailed = true;
+            }
+        } catch (e) {
+            groupReloadFailed = true;
+            console.warn(`[${EXT}] group cache reload failed`, e);
+        }
+    }
+
+    // Only the currently-loaded preset has a live UI panel to refresh;
+    // editing an inactive preset just updates its in-memory copy + the
+    // file on disk, and will show correctly next time it's loaded.
+    if (isCurrent) {
+        try { promptManager?.render?.(false); } catch (e) { console.warn(`[${EXT}] promptManager render failed`, e); }
+        // For the loaded preset, ST's regex engine reads the scripts off the
+        // live oai_settings we just mutated — persist that to settings.json too
+        // so the rename survives a reload without re-selecting the preset.
+        if (regexRenamed) { try { saveSettingsDebounced?.(); } catch (e) {} }
+    }
+    return { targetName, applied, isCurrent, regexRenamed, groupRenamed, runnerRenamed, groupReloadFailed, runnerLiveUpdated };
+}
+
+// ── Shared: apply one world-info entry's cached translation, in place ──
+// Used by both the JSON export and the live apply so the two never drift on
+// the subtle parts (keyword marker lines, selectiveLogic-aware secondary keys).
+// Returns the number of fields changed; 0 means nothing was cached for it.
+function applyWiEntryTranslation(entry, ns, entryId, titlesOnly) {
+    if (!entry) return 0;
+    let changed = 0;
+
+    const cached = getTranslated(ns, entryId);
+    const title = getTranslatedTitle(ns, entryId);
+    if (title) { entry.comment = title; changed++; }
+    // Titles-only leaves content AND the trigger keywords alone — keys are part
+    // of how the entry fires, not part of its label.
+    if (titlesOnly || !cached) return changed;
+
+    const { body: afterTitle } = splitTitleAndBody(cached);
+    const parsed = splitKeysAndBody(afterTitle);
+    // Guard against false positives: only honour a marker line if the
+    // original entry actually had that field. Otherwise a body that
+    // genuinely starts with "**Keys:**" would be mis-read as metadata.
+    const hadKeys    = Array.isArray(entry.key) && entry.key.length > 0;
+    const hadFilters = Array.isArray(entry.keysecondary) && entry.keysecondary.length > 0;
+    const keys    = hadKeys    ? parsed.keys    : null;
+    const filters = hadFilters ? parsed.filters : null;
+    // If a marker was parsed but the original had no such field, that line
+    // was real content — put it back so nothing is lost.
+    let body = parsed.body;
+    if ((parsed.keys && !hadKeys) || (parsed.filters && !hadFilters)) body = afterTitle;
+    if (typeof body === 'string') { entry.content = body; changed++; }
+
+    const mergeList = (orig, added) => {
+        const out = [], seen = new Set();
+        for (const k of [...(Array.isArray(orig) ? orig : []), ...added]) {
+            const v = String(k || '').trim();
+            if (!v || seen.has(v)) continue;
+            seen.add(v);
+            out.push(v);
+        }
+        return out;
+    };
+
+    // Primary keys use "any one matches" semantics, so merging original and
+    // translated terms is always safe and lets the entry fire either way.
+    if (keys && keys.length) { entry.key = mergeList(entry.key, keys); changed++; }
+
+    // Secondary keys depend on selectiveLogic (ST world_info_logic):
+    //   0 AND_ANY  — any secondary matches      → merging is safe
+    //   1 NOT_ALL  — blocked only if ALL match  → merging breaks the block
+    //   2 NOT_ANY  — blocked if any match       → merging is safe (and desirable)
+    //   3 AND_ALL  — ALL secondaries must match → merging kills the entry
+    // For the two "ALL" logics, extra terms change the condition itself, so
+    // we replace with the translated terms instead of merging. The result is
+    // meant to be used in the target language, so those terms should apply.
+    if (filters && filters.length) {
+        const logic = Number(entry.selectiveLogic ?? 0);
+        const isAllLogic = (logic === 1 || logic === 3);
+        entry.keysecondary = isAllLogic ? filters.slice() : mergeList(entry.keysecondary, filters);
+        changed++;
+    }
+    return changed;
 }
 
 // ── JSON Export: World Info ───────────────────────────────────────────
@@ -1379,57 +2191,70 @@ async function exportWorldInfoJSON(worldName, selectedIds) {
     for (const key of Object.keys(cloned.entries)) {
         const entry = cloned.entries[key];
         if (!entry) continue;
-        const entryId = `${worldName}::${entry.uid ?? key}`;
-        const cached = getTranslated(ns, entryId);
-        const title = getTranslatedTitle(ns, entryId);
-        if (title) entry.comment = title;
-        if (!cached) continue;
-        const { body: afterTitle } = splitTitleAndBody(cached);
-        const parsed = splitKeysAndBody(afterTitle);
-        // Guard against false positives: only honour a marker line if the
-        // original entry actually had that field. Otherwise a body that
-        // genuinely starts with "**Keys:**" would be mis-read as metadata.
-        const hadKeys    = Array.isArray(entry.key) && entry.key.length > 0;
-        const hadFilters = Array.isArray(entry.keysecondary) && entry.keysecondary.length > 0;
-        const keys    = hadKeys    ? parsed.keys    : null;
-        const filters = hadFilters ? parsed.filters : null;
-        // If a marker was parsed but the original had no such field, that line
-        // was real content — put it back so nothing is lost.
-        let body = parsed.body;
-        if ((parsed.keys && !hadKeys) || (parsed.filters && !hadFilters)) body = afterTitle;
-        if (typeof body === 'string') entry.content = body;
-
-        const mergeList = (orig, added) => {
-            const out = [], seen = new Set();
-            for (const k of [...(Array.isArray(orig) ? orig : []), ...added]) {
-                const v = String(k || '').trim();
-                if (!v || seen.has(v)) continue;
-                seen.add(v);
-                out.push(v);
-            }
-            return out;
-        };
-
-        // Primary keys use "any one matches" semantics, so merging original and
-        // translated terms is always safe and lets the entry fire either way.
-        if (keys && keys.length) entry.key = mergeList(entry.key, keys);
-
-        // Secondary keys depend on selectiveLogic (ST world_info_logic):
-        //   0 AND_ANY  — any secondary matches      → merging is safe
-        //   1 NOT_ALL  — blocked only if ALL match  → merging breaks the block
-        //   2 NOT_ANY  — blocked if any match       → merging is safe (and desirable)
-        //   3 AND_ALL  — ALL secondaries must match → merging kills the entry
-        // For the two "ALL" logics, extra terms change the condition itself, so
-        // we replace with the translated terms instead of merging. The exported
-        // card is meant to be used in the target language, so the translated
-        // terms are the ones that should apply.
-        if (filters && filters.length) {
-            const logic = Number(entry.selectiveLogic ?? 0);
-            const isAllLogic = (logic === 1 || logic === 3);
-            entry.keysecondary = isAllLogic ? filters.slice() : mergeList(entry.keysecondary, filters);
-        }
+        applyWiEntryTranslation(entry, ns, `${worldName}::${entry.uid ?? key}`);
     }
     return { data: cloned, filename: `${sanitizeFilename(worldName)}_${effLang()}.json` };
+}
+
+// ── Live Apply: World Info ──────────────────────────────────────────
+// Writes cached translations straight into the world-info book and saves it
+// through ST's own saveWorldInfo() — no file to export and re-import.
+// Respects the checkbox selection: with entries selected, only those are
+// rewritten and every other entry is left exactly as it was (this never
+// deletes entries, unlike the partial JSON *export* which filters them out).
+async function applyWorldInfoLive(worldName, selectedIds, titlesOnly) {
+    if (!worldName) throw new Error('월드인포를 찾을 수 없습니다');
+    const ctx = SillyTavern?.getContext?.() || getContext?.();
+    if (!ctx?.loadWorldInfo || !ctx?.saveWorldInfo) {
+        throw new Error('월드인포 저장 함수를 찾을 수 없습니다 (ST 버전이 호환되지 않을 수 있습니다)');
+    }
+    const wi = await ctx.loadWorldInfo(worldName);
+    if (!wi || !wi.entries) throw new Error('월드인포 데이터를 찾을 수 없습니다');
+
+    // Same ns readWorldInfo()/exportWorldInfoJSON() use.
+    const ns = `pt-wi::${worldName}`;
+    const isPartial = selectedIds instanceof Set && selectedIds.size > 0;
+
+    let applied = 0, touched = 0;
+    for (const key of Object.keys(wi.entries)) {
+        const entry = wi.entries[key];
+        if (!entry) continue;
+        const entryId = `${worldName}::${entry.uid ?? key}`;
+        if (isPartial) {
+            // uid may be a number or string depending on how the book was made
+            const candidates = [entryId, `${worldName}::${String(entry.uid)}`, `${worldName}::${key}`];
+            if (!candidates.some(c => selectedIds.has(c))) continue;
+        }
+        const n = applyWiEntryTranslation(entry, ns, entryId, titlesOnly);
+        if (!n) continue;
+        applied += n;
+        touched++;
+        // Character books carry an `originalData` mirror that ST keeps in sync
+        // on every edit; without this the mirror would still hold the original
+        // text and could be written back over ours later.
+        if (wi.originalData && typeof setWIOriginalDataValue === 'function') {
+            try {
+                setWIOriginalDataValue(wi, entry.uid, 'comment', entry.comment);
+                // Titles-only never touched these; mirroring them would be a
+                // no-op at best and could re-write untouched fields at worst.
+                if (!titlesOnly) {
+                    setWIOriginalDataValue(wi, entry.uid, 'content', entry.content);
+                    setWIOriginalDataValue(wi, entry.uid, 'keys', entry.key);
+                    setWIOriginalDataValue(wi, entry.uid, 'secondary_keys', entry.keysecondary);
+                }
+            } catch (e) { console.warn(`[${EXT}] originalData sync failed`, e); }
+        }
+    }
+    if (!applied) throw new Error(titlesOnly
+        ? '적용할 제목 번역이 없습니다. 먼저 📛 제목 번역을 실행하세요.'
+        : '적용할 번역이 없습니다. 먼저 번역을 실행하세요.');
+
+    // immediately = true: don't leave the write sitting in ST's debounce queue.
+    await ctx.saveWorldInfo(worldName, wi, true);
+    // Refresh the WI editor only when this book is the one open in it.
+    try { ctx.reloadWorldInfoEditor?.(worldName); } catch (e) { console.warn(`[${EXT}] WI editor reload failed`, e); }
+
+    return { targetName: worldName, applied, entries: touched };
 }
 
 // ── JSON Export: Character Card ───────────────────────────────────────
@@ -1546,6 +2371,106 @@ async function exportCharacterJSON(charIdRaw, opts, selectedIds) {
     return { data: cloned, filename: `${sanitizeFilename(name)}_${effLang()}.json` };
 }
 
+// ── Live Apply: Character Card ──────────────────────────────────────
+// Writes cached translations straight into the character PNG through the same
+// '/api/characters/merge-attributes' endpoint ST's own character editor and
+// /update-char command use — no JSON to export and re-import.
+// Respects the checkbox selection: with fields selected, only those are
+// written; every other field keeps its current value (unlike the partial JSON
+// *export*, which blanks the unselected ones).
+async function applyCharacterLive(charIdRaw, selectedIds) {
+    let idx = -1;
+    const ctx = SillyTavern?.getContext?.() || getContext?.();
+    if (charIdRaw === '__cur__' || charIdRaw === undefined || charIdRaw === null || charIdRaw === '') {
+        idx = ctx?.characterId !== undefined ? Number(ctx.characterId) : -1;
+    } else {
+        idx = findCharIndex(charIdRaw);
+    }
+    if (idx < 0 || !characters?.[idx]) throw new Error('캐릭터를 찾을 수 없습니다');
+
+    try { await unshallowCharacter?.(idx); } catch (e) {}
+    const char = characters[idx];
+    if (!char) throw new Error('캐릭터 데이터 없음');
+    // The endpoint identifies the target card by its avatar filename, so a card
+    // without one can't be written to safely.
+    if (!char.avatar) throw new Error('아바타 파일명이 없어 저장 대상을 특정할 수 없습니다');
+
+    // Namespace matches page load: pt-char::{avatar}
+    const ns = `pt-char::${char.avatar}`;
+    const isPartial = selectedIds instanceof Set && selectedIds.size > 0;
+    const shouldApply = fieldId => !isPartial || selectedIds.has(fieldId);
+
+    // The server deep-merges this object into the card, so only the keys we
+    // send are changed. V1 (top-level) and V2 (data.*) are both written, the
+    // same as ST's own character update path, so readers of either agree.
+    const update = { avatar: char.avatar, data: {} };
+    let applied = 0;
+
+    const MAIN_FIELDS = [
+        'description', 'personality', 'scenario', 'first_mes', 'mes_example',
+        'system_prompt', 'post_history_instructions', 'creator_notes',
+    ];
+    for (const f of MAIN_FIELDS) {
+        if (!shouldApply(f)) continue;
+        const t = getTranslatedBody(ns, f);
+        if (t === null) continue;
+        update[f] = t;
+        update.data[f] = t;
+        applied++;
+    }
+
+    // Alternate greetings: deepMerge replaces arrays wholesale, so the full
+    // list has to be sent with only the translated slots substituted.
+    const alts = char.data?.alternate_greetings || char.alternate_greetings || null;
+    if (Array.isArray(alts) && alts.length) {
+        const next = alts.slice();
+        let hits = 0;
+        for (let i = 0; i < next.length; i++) {
+            const fieldId = `alt_greeting_${i}`;
+            if (!shouldApply(fieldId)) continue;
+            const t = getTranslatedBody(ns, fieldId);
+            if (t === null) continue;
+            next[i] = t;
+            hits++;
+        }
+        if (hits) {
+            update.data.alternate_greetings = next;
+            update.alternate_greetings = next;
+            applied += hits;
+        }
+    }
+
+    // Character's Note = data.extensions.depth_prompt.prompt (keep depth/role)
+    if (shouldApply('character_note')) {
+        const t = getTranslatedBody(ns, 'character_note');
+        const dp = char.data?.extensions?.depth_prompt;
+        if (t !== null && dp) {
+            update.data.extensions = { depth_prompt: { ...dp, prompt: t } };
+            applied++;
+        }
+    }
+
+    if (!applied) throw new Error('적용할 번역이 없습니다. 먼저 번역을 실행하세요.');
+    if (!Object.keys(update.data).length) delete update.data;
+
+    const res = await fetch('/api/characters/merge-attributes', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify(update),
+    });
+    if (!res.ok) throw new Error(`저장 실패 (HTTP ${res.status})`);
+
+    // Pull the saved card back into ST's in-memory list so the panel and the
+    // character editor both read the new text.
+    try { await ctx?.getOneCharacter?.(char.avatar); } catch (e) { console.warn(`[${EXT}] character reload failed`, e); }
+    try {
+        await eventSource?.emit?.(event_types.CHARACTER_EDITED, { detail: { id: idx, character: characters?.[idx] } });
+    } catch (e) { console.warn(`[${EXT}] CHARACTER_EDITED emit failed`, e); }
+
+    const isCurrent = ctx?.characterId != null && Number(ctx.characterId) === idx;
+    return { targetName: char.name || `#${idx}`, applied, isCurrent };
+}
+
 // ── Title-only translation (batched) ─────────────────────────────────
 // Translates just the toggle/entry names, in batches, so a user can skim a
 // large preset and decide what is worth translating in full.
@@ -1582,7 +2507,7 @@ function parseNumberedTitles(raw, expectedCount) {
 }
 
 async function translateTitleBatch(names) {
-    const lang = effLang();
+    const lang = effLang('title');
     const numbered = names.map((n, i) => `${i + 1}. ${n}`).join('\n');
     const prompt =
 `Translate each of the following ${names.length} short labels into ${lang}.
@@ -1602,41 +2527,7 @@ ${numbered}
 
 Now output the ${names.length} numbered lines, translated into ${lang}.`;
 
-    const c = cfg();
-    const prov = c.provider || 'openai';
-    const source = PROVIDER_TO_SOURCE[prov] || prov;
-    const model = (c.model === '__custom__' ? (c.customModelName || '') : (c.model || '')) || '';
-
-    const messages = [{ role: 'user', content: prompt }];
-    if (c.prefillEnabled && c.prefillText?.trim()) {
-        const role = (source === 'makersuite' || source === 'google' || source === 'vertexai') ? 'model' : 'assistant';
-        messages.push({ role, content: c.prefillText.trim() });
-    }
-
-    const { params } = getCurrentParams();
-    const providerParams = getProviderSpecificParams(prov, params);
-    const parameters = { model, messages, stream: false, chat_completion_source: source, ...providerParams };
-    if (source === 'vertexai') {
-        parameters.vertexai_auth_mode = oai_settings?.vertexai_auth_mode || 'full';
-        const region = oai_settings?.vertexai_region;
-        if (region) parameters.vertexai_region = region;
-        if (parameters.vertexai_auth_mode === 'express' && oai_settings?.vertexai_express_project_id) {
-            parameters.vertexai_express_project_id = oai_settings.vertexai_express_project_id;
-        }
-    }
-    if (c.useReverseProxy && c.reverseProxyUrl?.trim()) {
-        parameters.reverse_proxy = c.reverseProxyUrl.trim();
-        parameters.proxy_password = c.reverseProxyPassword || '';
-    }
-
-    const resp = await fetch('/api/backends/chat-completions/generate', {
-        method: 'POST', headers: getRequestHeaders(), body: JSON.stringify(parameters),
-    });
-    if (!resp.ok) throw new Error(`API ${resp.status}`);
-    const d = await resp.json();
-    let result = d.choices?.[0]?.message?.content?.trim()
-        || d.content?.[0]?.text?.trim()
-        || d.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+    const result = await runCompletion(buildMessages(prompt));
     return parseNumberedTitles(result, names.length);
 }
 
@@ -1690,7 +2581,12 @@ async function runTitleTranslation({ items, list, ns, pBar, pLabel, pWrap, btnSt
         try {
             const translated = await translateTitleBatch(batch.map(b => b.name));
             if (translated) {
-                batch.forEach((b, i) => { setCacheTitle(ns, b.id, translated[i]); });
+                batch.forEach((b, i) => {
+                    setCacheTitle(ns, b.id, translated[i]);
+                    // Title-only blocks show the translated name in their
+                    // 번역 box (they have no body), so refresh it in place.
+                    if (b.titleOnly) setBlockHTML(list, b.id, esc(translated[i]));
+                });
                 okCount += batch.length;
             } else {
                 // Ambiguous reply — discard this batch instead of guessing.
@@ -1731,12 +2627,20 @@ function buildPage({ page, idPfx, listFn, loadFn, selectable, icon, hint, isAsyn
     page.innerHTML = `
         <div class="pt-page-fixed">
             <div class="pt-toolbar">
-                <select class="pt-select" id="${idPfx}-sel"><option value="">— 선택 —</option></select>
+                <div class="pt-combo" id="${idPfx}-combo">
+                    <input type="text" class="pt-combo-input" id="${idPfx}-cinput" placeholder="— 선택 —" autocomplete="off" spellcheck="false" role="combobox" aria-expanded="false" aria-autocomplete="list">
+                    <span class="pt-combo-caret" aria-hidden="true">▾</span>
+                    <div class="pt-combo-list" id="${idPfx}-clist" role="listbox"></div>
+                </div>
+                <select class="pt-select pt-combo-native" id="${idPfx}-sel"><option value="">— 선택 —</option></select>
                 <button class="pt-btn pt-btn-secondary" id="${idPfx}-load">📂 로드</button>
                 <div class="pt-export-group">
+                    <button class="pt-btn-icon" id="${idPfx}-apply" title="${kind === 'wi' ? '월드인포에 즉시 적용' : kind === 'char' ? '봇카드에 즉시 적용' : '프리셋에 즉시 적용'}"><i class="fa-solid fa-bolt"></i></button>
                     <button class="pt-btn-icon" id="${idPfx}-copy" title="복사"><i class="fa-solid fa-copy"></i></button>
                     <button class="pt-btn-icon" id="${idPfx}-txt" title="TXT 내보내기"><i class="fa-solid fa-file-lines"></i></button>
                     <button class="pt-btn-icon" id="${idPfx}-json" title="JSON 내보내기"><i class="fa-solid fa-file-code"></i></button>
+                    ${kind === 'char' ? '' : `<button class="pt-btn-icon" id="${idPfx}-tm" title="번역 메모리"><i class="fa-solid fa-box-archive"></i></button>
+                    <input type="file" id="${idPfx}-tmfile" accept="application/json,.json" style="display:none;">`}
                 </div>
             </div>
             <div class="pt-progress-wrap" id="${idPfx}-prog">
@@ -1817,11 +2721,174 @@ function buildPage({ page, idPfx, listFn, loadFn, selectable, icon, hint, isAsyn
     const hideEmpty = () => { empty.style.display='none'; ctrl.style.display=''; if(saRow)saRow.style.display=''; };
     showEmpty(hint);
 
+    // Chunked (re)render of the currently loaded `items` into the list DOM.
+    // Shared by the initial load and by TM import (which updates the cache
+    // for already-loaded items and needs the previews refreshed without a
+    // full reload).
+    const renderList = (snap) => {
+        list.innerHTML = '';
+        let i = 0;
+        const renderChunk = () => {
+            const end = Math.min(i + 50, items.length), frag = PDOC.createDocumentFragment();
+            for (; i < end; i++) frag.appendChild(makeBlockItem(items[i], ns, selectable, applyEyeMode));
+            list.appendChild(frag);
+            if (i < items.length) requestAnimationFrame(renderChunk);
+            else {
+                if (snap) {
+                    // Put back what the person had set up before the panel closed.
+                    if (snap.selected?.size) {
+                        list.querySelectorAll('.pt-block-item').forEach(el => {
+                            if (!snap.selected.has(el.dataset.id)) return;
+                            el.classList.add('selected');
+                            const cb = el.querySelector('.pt-checkbox');
+                            if (cb) cb.checked = true;
+                        });
+                    }
+                    if (searchEl) searchEl.value = snap.search || '';
+                    if (snap.search) applySearchFilter(snap.search.trim().toLowerCase());
+                } else if (searchEl) {
+                    searchEl.value = '';
+                }
+                updateSelectedCount(page);
+                applyEyeMode();
+                if (snap?.scrollTop && scrollEl) scrollEl.scrollTop = snap.scrollTop;
+            }
+        };
+        renderChunk();
+    };
+
+    // ── Close/open lifecycle ──────────────────────────────────────────
+    // sleep() drops the rendered rows out of ST's document; wake() rebuilds
+    // them from `items` and restores selection, search and scroll position.
+    const scrollEl = page.querySelector('.pt-page-scroll');
+    let dormant = null;   // snapshot while asleep, null while awake
+    PAGE_HOOKS.push({
+        sleep() {
+            // Never yank the list out from under a running translation — the
+            // progress writes target these very rows.
+            if (isBusy || dormant || !list.childElementCount) return;
+            dormant = {
+                selected: new Set([...list.querySelectorAll('.pt-block-item.selected')].map(el => el.dataset.id)),
+                search: searchEl?.value || '',
+                scrollTop: scrollEl?.scrollTop || 0,
+            };
+            clearTimeout(searchTimeout);
+            list.innerHTML = '';
+        },
+        wake() {
+            if (!dormant) return;
+            const snap = dormant;
+            dormant = null;
+            if (items.length) renderList(snap);
+        },
+    });
+
+    // ── Searchable dropdown ───────────────────────────────────────────
+    // The native <select> stays in the DOM and remains the source of truth —
+    // every other code path (load, apply, export, getSourceName, the ↻ refresh)
+    // reads sel.value / sel.options, so none of them had to change. The combo
+    // is a thin filter UI in front of it; picking an entry writes through to
+    // the select and fires 'change'.
+    const combo  = page.querySelector(`#${idPfx}-combo`);
+    const cInput = page.querySelector(`#${idPfx}-cinput`);
+    const cList  = page.querySelector(`#${idPfx}-clist`);
+    let comboOpen = false, activeIdx = -1, matches = [];
+
+    const realOptions = () => [...sel.options].filter(o => o.value);
+    const selectedLabel = () => {
+        const o = sel.options[sel.selectedIndex];
+        return (o && o.value) ? o.textContent : '';
+    };
+    // Keep the input showing the current selection; called after every refill.
+    const syncCombo = () => { if (cInput) cInput.value = selectedLabel(); };
+
+    const closeCombo = (restoreLabel = true) => {
+        comboOpen = false; activeIdx = -1;
+        combo?.classList.remove('open');
+        cInput?.setAttribute('aria-expanded', 'false');
+        if (restoreLabel) syncCombo();
+    };
+
+    const renderCombo = (query) => {
+        const q = (query || '').trim().toLowerCase();
+        matches = realOptions().filter(o => !q || o.textContent.toLowerCase().includes(q));
+        if (!matches.length) {
+            cList.innerHTML = `<div class="pt-combo-empty">결과 없음</div>`;
+            return;
+        }
+        const cur = sel.value;
+        cList.innerHTML = matches.map((o, i) => {
+            const label = q ? highlightText(esc(o.textContent), q) : esc(o.textContent);
+            const cls = ['pt-combo-item'];
+            if (o.value === cur) cls.push('current');
+            if (i === activeIdx) cls.push('active');
+            return `<div class="${cls.join(' ')}" role="option" data-v="${esc(o.value)}" data-i="${i}">${label}</div>`;
+        }).join('');
+    };
+
+    const setActive = (i) => {
+        if (!matches.length) return;
+        activeIdx = (i + matches.length) % matches.length;
+        cList.querySelectorAll('.pt-combo-item').forEach(el => {
+            const on = Number(el.dataset.i) === activeIdx;
+            el.classList.toggle('active', on);
+            if (on) el.scrollIntoView({ block: 'nearest' });
+        });
+    };
+
+    const openCombo = (query) => {
+        comboOpen = true;
+        combo?.classList.add('open');
+        cInput?.setAttribute('aria-expanded', 'true');
+        activeIdx = -1;
+        renderCombo(query);
+        // Put the current entry in view so a long list opens where you left off.
+        const cur = cList.querySelector('.pt-combo-item.current');
+        if (cur) cur.scrollIntoView({ block: 'nearest' });
+    };
+
+    const pick = (value) => {
+        sel.value = value;
+        closeCombo();
+        try { sel.dispatchEvent(new (PDOC.defaultView || window).Event('change', { bubbles: true })); } catch (e) {}
+    };
+
+    cInput?.addEventListener('focus', () => { cInput.select(); openCombo(''); });
+    cInput?.addEventListener('input', () => { if (!comboOpen) comboOpen = true; combo?.classList.add('open'); activeIdx = -1; renderCombo(cInput.value); });
+    combo?.querySelector('.pt-combo-caret')?.addEventListener('mousedown', e => {
+        e.preventDefault();
+        comboOpen ? closeCombo() : (cInput.focus(), openCombo(''));
+    });
+    cInput?.addEventListener('keydown', e => {
+        if (e.key === 'ArrowDown')      { e.preventDefault(); if (!comboOpen) openCombo(cInput.value); else setActive(activeIdx + 1); }
+        else if (e.key === 'ArrowUp')   { e.preventDefault(); if (comboOpen) setActive(activeIdx - 1); }
+        else if (e.key === 'Enter')     {
+            if (comboOpen && matches.length) {
+                e.preventDefault();
+                pick(matches[activeIdx >= 0 ? activeIdx : 0].value);
+            }
+        }
+        else if (e.key === 'Escape')    { if (comboOpen) { e.stopPropagation(); closeCombo(); } }
+    });
+    cList?.addEventListener('mousedown', e => {
+        const item = e.target.closest('.pt-combo-item');
+        if (!item) return;
+        e.preventDefault();   // keep focus so blur does not fight the pick
+        pick(item.dataset.v);
+    });
+    cInput?.addEventListener('blur', () => setTimeout(() => closeCombo(), 120));
+
     const refillSelect = async () => {
+        const keep = sel.value;
         sel.innerHTML='<option value="">— 선택 —</option>';
         const opts=isAsync?await listFn():listFn();
         opts.forEach(item=>{ const o=PDOC.createElement('option'); o.value=item.id; o.textContent=item.name; sel.appendChild(o); });
+        // A refill must not silently drop what the person had chosen.
+        if (keep && [...sel.options].some(o => o.value === keep)) sel.value = keep;
+        syncCombo();
     };
+    // The ↻ refresh rebuilds this select from outside buildPage; let it re-sync.
+    sel._ptSyncCombo = syncCombo;
     refillSelect();
     if (idPfx==='pt-char') {
         try { eventSource?.on?.(event_types?.APP_READY, refillSelect); } catch(e){}
@@ -1838,6 +2905,16 @@ function buildPage({ page, idPfx, listFn, loadFn, selectable, icon, hint, isAsyn
         ns=`${idPfx}::${val||'__cur__'}`;
         showEmpty('로딩 중...');
         items=isAsync?await loadFn(val):await loadFn(val);
+        // 이 확장이 예전에 적용해 둔 주석 블록은 "원문"이 아니다. 원문에서 떼어
+        // 내어, ① 모델에 우리 주석을 원문인 양 다시 보내지 않고 ② 로컬 캐시가
+        // 없어도 주석이 이미 존재한다는 것을 파일만 보고 알 수 있게 한다.
+        for (const it of items) {
+            if (!it || typeof it.content !== 'string') continue;
+            const { source, note } = extractOwnNote(it.content);
+            if (!note) continue;
+            it.content = source;
+            it.injectedNote = note;
+        }
         list.innerHTML='';
 
         // 선택 상태 완전 초기화 (프리셋 변경 시 이전 선택이 남지 않도록)
@@ -1851,28 +2928,12 @@ function buildPage({ page, idPfx, listFn, loadFn, selectable, icon, hint, isAsyn
         const totalTkn=items.reduce((s,i)=>s+estimateTokens(i.content||''),0);
         const cntEl=page.querySelector(`#${idPfx}-cnt`);
         if (cntEl) cntEl.textContent=`📊 ${items.length}개 · ${totalTkn.toLocaleString()} tkn`;
-        let i=0;
-        const renderChunk=()=>{
-            const end=Math.min(i+50,items.length), frag=PDOC.createDocumentFragment();
-            for(;i<end;i++) frag.appendChild(makeBlockItem(items[i],ns,selectable));
-            list.appendChild(frag);
-            if(i<items.length) requestAnimationFrame(renderChunk);
-            else {
-                if(searchEl)searchEl.value='';
-                updateSelectedCount(page);
-                // Re-apply eye-mode to freshly rendered items if currently ON
-                applyEyeMode();
-            }
-        };
-        renderChunk();
+        renderList();
     });
 
     // Search with highlight
     let searchTimeout = null;
-    searchEl?.addEventListener('input', () => {
-        clearTimeout(searchTimeout);
-        searchTimeout = setTimeout(() => {
-            const q=searchEl.value.trim().toLowerCase();
+    const applySearchFilter = (q) => {
             list.querySelectorAll('.pt-block-item').forEach(el=>{
                 if (!q) {
                     el.style.display='';
@@ -1892,7 +2953,10 @@ function buildPage({ page, idPfx, listFn, loadFn, selectable, icon, hint, isAsyn
                     }
                 }
             });
-        }, 120);
+    };
+    searchEl?.addEventListener('input', () => {
+        clearTimeout(searchTimeout);
+        searchTimeout = setTimeout(() => applySearchFilter(searchEl.value.trim().toLowerCase()), 120);
     });
 
     page.querySelector(`#${idPfx}-allcb`)?.addEventListener('change', ev => {
@@ -1904,9 +2968,23 @@ function buildPage({ page, idPfx, listFn, loadFn, selectable, icon, hint, isAsyn
         updateSelectedCount(page);
     });
 
-    const mkArgs=force=>({items,list,ns,pBar,pLabel,pWrap,btnStop,forceRetranslate:!!force});
-    page.querySelector(`#${idPfx}-trans`).addEventListener('click',async()=>{await runTranslation(mkArgs(false));});
-    page.querySelector(`#${idPfx}-retr`).addEventListener('click',async()=>{if(!confirm('재번역?')) return; await runTranslation(mkArgs(true));});
+    const mkArgs=(force,mode)=>({items,list,ns,pBar,pLabel,pWrap,btnStop,forceRetranslate:!!force,mode});
+    // 본문을 "번역"으로 쓸지 "주석"으로 붙일지는 매 실행마다 고른다. 한 번의
+    // 요청이 번역과 주석을 동시에 만들지 않게 하려는 것 — 나눠 돌린 결과는
+    // "본문 번역\n{{// 주석 번역}}" 형태로 자동 병합된다.
+    const askTransMode = () => askChoice('본문을 어떻게 번역할까요?', [
+        { v:'body', label:'✦ 완전 번역 (본문에 번역)' },
+        { v:'note', label:'💬 주석으로 추가 ({{// }})' },
+    ]);
+    page.querySelector(`#${idPfx}-trans`).addEventListener('click',async()=>{
+        const mode=await askTransMode(); if(!mode) return;
+        await runTranslation(mkArgs(false,mode));
+    });
+    page.querySelector(`#${idPfx}-retr`).addEventListener('click',async()=>{
+        const mode=await askTransMode(); if(!mode) return;
+        if(!confirm(mode==='note'?'주석을 다시 번역할까요? (본문 번역은 유지됩니다)':'본문을 재번역할까요? (주석은 유지됩니다)')) return;
+        await runTranslation(mkArgs(true,mode));
+    });
     page.querySelector(`#${idPfx}-titles`)?.addEventListener('click',async()=>{
         await runTitleTranslation({
             items, list, ns, pBar, pLabel, pWrap, btnStop,
@@ -2028,6 +3106,287 @@ function buildPage({ page, idPfx, listFn, loadFn, selectable, icon, hint, isAsyn
             if (typeof toastr!=='undefined') toastr.error('JSON 내보내기 실패: ' + (err?.message || err));
         }
     });
+
+    // ── Translation Memory (TM): export ─────────────────────────────────
+    // A portable file (original title/content + translated title/content),
+    // independent of the browser-local IndexedDB cache and of this item's
+    // identifier — so it survives moving to another device/browser, and
+    // survives the source (preset/WI/character) being updated to a new
+    // version with different internal ids, as long as the title or content
+    // text is still recognizably the same.
+    // scope: 'full'  → 제목 + 본문(주석 포함) 번역을 모두 내보낸다.
+    //        'title' → 제목 번역만 내보낸다. 원문 name/content는 매칭 키로
+    //                  남겨두되 contentTranslated는 절대 쓰지 않는다.
+    function exportTM(scope) {
+        const titleOnlyExport = scope === 'title';
+        if (!items.length) { if (typeof toastr!=='undefined') toastr.warning('로드된 데이터가 없습니다'); return; }
+        const entries = [];
+        for (const it of items) {
+            const name = (it.name || '').trim();
+            const content = (it.content || '').trim();
+            // Preset regex scripts are title-only: their "content" is a regex
+            // pattern, so no body translation is ever exported for them.
+            const isTitleOnly = !!it.titleOnly;
+            const full = (isTitleOnly || titleOnlyExport) ? null : getCached(ns, it.id);
+            const contentTranslated = full ? splitTitleAndBody(full).body.trim() : '';
+            const titleRaw = getTranslatedTitle(ns, it.id);
+            const nameTranslated = (titleRaw && titleRaw.trim() && titleRaw.trim() !== name) ? titleRaw.trim() : '';
+            if (!contentTranslated && !nameTranslated) continue; // nothing translated for this item
+            // id는 "같은 프리셋을 그대로 재가져오기" 했을 때 100% 정확한 매칭을 위해 함께 저장.
+            // (동일 프리셋 안에서는 identifier가 항상 고유하므로, 서로 다른 블록이
+            //  우연히 같은 content/title 텍스트를 가져도 id로는 절대 모호해지지 않는다.)
+            // id가 없는 옛 TM 파일이나 프리셋이 갱신되어 id가 바뀐 경우를 위해
+            // content/name 매칭은 그대로 폴백으로 남겨둔다.
+            // content(원문 본문)는 본문 번역을 실제로 담고 있는 항목에만 넣는다.
+            // 가져오기 때 "원문이 정말 같은지" 대조하기 위한 키이므로, 본문 번역이
+            // 없는 항목(제목만 내보내기 / 제목만 번역된 항목)에는 쓸모가 없고
+            // 파일만 원문 전체만큼 부풀린다.
+            const entry = { id: it.id, name };
+            if (contentTranslated) entry.content = content;
+            if (isTitleOnly) entry.titleOnly = true;
+            if (nameTranslated) entry.nameTranslated = nameTranslated;
+            if (contentTranslated) entry.contentTranslated = contentTranslated;
+            entries.push(entry);
+        }
+        if (!entries.length) {
+            if (typeof toastr!=='undefined') toastr.warning(titleOnlyExport ? '내보낼 제목 번역이 없습니다' : '내보낼 번역이 없습니다');
+            return;
+        }
+        const srcName = getSourceName(kind, page, idPfx);
+        // Everything here is load-bearing: `type` validates the file, `kind`
+        // rejects a memory exported from a different source type, `version` is
+        // the escape hatch if the entry shape ever changes. Source name and
+        // language live in the filename; export time was never read by anything.
+        const payload = { type: 'prompt-panel-tm', version: 1, kind, entries };
+        const label = titleOnlyExport ? '[번역 메모리-제목]' : '[번역 메모리]';
+        const filename = `${label} ${sanitizeFilename(srcName)}.json`;
+        downloadBlob(new Blob([JSON.stringify(payload, null, 2)], {type:'application/json;charset=utf-8'}), filename);
+        if (typeof toastr!=='undefined') toastr.success(`번역 메모리 ${entries.length}개 항목 내보냄 (${filename})`);
+    }
+
+    // ── Translation Memory (TM): import ─────────────────────────────────
+    // Matches each currently-loaded item to a TM entry in three passes:
+    //   1) exact id match   2) exact original content   3) exact original title
+    // For passes 2 and 3, a key that maps to more than one TM entry is
+    // ambiguous and is skipped entirely rather than risking a wrong match.
+    //
+    // A candidate found this way is then VERIFIED before anything is written,
+    // because an id is not globally unique — world-info uids are small integers
+    // scoped to a book name ("내 책::0") and preset system toggles all share
+    // 'main'/'jailbreak'/… , so a TM someone else shared can land on a totally
+    // unrelated entry. The body is written only when the TM's stored original
+    // text is identical to the current one; the title only when the names agree
+    // (or the body already verified). A mismatch loses part of the import — it
+    // never writes the wrong translation.
+    const tmFileInput = page.querySelector(`#${idPfx}-tmfile`);
+    function importTM() {
+        if (!items.length) { if (typeof toastr!=='undefined') toastr.warning('먼저 데이터를 로드하세요'); return; }
+        tmFileInput?.click();
+    }
+
+    // ── Translation Memory (TM): single entry-point button ─────────────
+    // One toolbar button covers both directions; askChoice() shows a modal
+    // (same style as the copy/export "원문만 / 번역문만 / 둘 다" picker)
+    // so the person picks export vs. import each time they click it.
+    page.querySelector(`#${idPfx}-tm`)?.addEventListener('click', async () => {
+        const choice = await askChoice('번역 메모리에 대해 어떤 작업을 할까요?', [
+            { v: 'title',  label: '제목만 내보내기' },
+            { v: 'full',   label: '전체 내보내기' },
+            { v: 'import', label: '메모리 가져오기' },
+        ]);
+        if (!choice) return;
+        if (choice === 'title' || choice === 'full') exportTM(choice);
+        else if (choice === 'import') importTM();
+    });
+
+    tmFileInput?.addEventListener('change', async (ev) => {
+        const file = ev.target.files?.[0];
+        ev.target.value = ''; // allow re-selecting the same file later
+        if (!file) return;
+        try {
+            const text = await file.text();
+            const data = JSON.parse(text);
+            if (!data || data.type !== 'prompt-panel-tm' || !Array.isArray(data.entries)) {
+                throw new Error('번역 메모리 파일 형식이 아닙니다');
+            }
+            // A memory exported from a different source type can only ever
+            // mismatch here — say so instead of reporting "0개 매칭".
+            if (data.kind && data.kind !== kind) {
+                const nameOf = k => k === 'wi' ? '월드인포' : k === 'char' ? '봇카드' : '프리셋';
+                throw new Error(`${nameOf(data.kind)} 번역 메모리입니다 (지금 탭은 ${nameOf(kind)})`);
+            }
+            const byId = new Map(), byContent = new Map(), byName = new Map();
+            const dupContent = new Set(), dupName = new Set();
+            for (const e of data.entries) {
+                const c = (e?.content || '').trim(), n = (e?.name || '').trim();
+                // id가 있는 항목은 최우선 매칭 키로 사용 (동일 프리셋 재가져오기 시 항상 고유 → 절대 모호해지지 않음)
+                if (e && e.id != null && e.id !== '') byId.set(String(e.id), e);
+                if (c) { if (byContent.has(c)) dupContent.add(c); else byContent.set(c, e); }
+                if (n) { if (byName.has(n)) dupName.add(n); else byName.set(n, e); }
+            }
+
+            let applied = 0, skipped = 0, staleBody = 0;
+            for (const it of items) {
+                const original = (it.content || '').trim();
+                const name = (it.name || '').trim();
+                let match = null;
+                // 후보 찾기 — id → 원문 → 제목 순. 여기서는 "어떤 항목일 가능성이
+                // 높은가"만 고르고, 실제로 무엇을 쓸지는 아래 검증이 결정한다.
+                if (it.id != null && byId.has(String(it.id))) match = byId.get(String(it.id));
+                if (!match && original && byContent.has(original) && !dupContent.has(original)) match = byContent.get(original);
+                if (!match && name && byName.has(name) && !dupName.has(name)) match = byName.get(name);
+                if (!match) { skipped++; continue; }
+
+                // ── 검증: 본문과 제목을 따로 판정한다 ──────────────────────
+                // id는 전역 고유가 아니다. 월드인포 uid는 책 이름 안에서만 유일한
+                // 작은 정수("내 책::0")이고, 프리셋 시스템 토글은 모든 프리셋이
+                // 'main'/'jailbreak' 같은 같은 id를 쓴다. 그래서 남이 공유한 TM이
+                // 전혀 다른 항목에 id로 걸릴 수 있다.
+                //   본문 번역 → TM이 들고 있는 원문이 지금 원문과 정확히 같을 때만.
+                //               (다르면 그 번역은 이미 없는 글을 옮긴 것이다)
+                //   제목 번역 → 제목이 같거나, 위 원문 대조를 통과했을 때만.
+                // 어긋나면 "덜 적용"될 뿐, 엉뚱한 번역이 조용히 들어가지 않는다.
+                const tmContent = (match.content || '').trim();
+                const bodyVerified  = !!tmContent && tmContent === original;
+                const titleVerified = bodyVerified || (!!name && (match.name || '').trim() === name);
+
+                const hasBodyRaw = !!(match.contentTranslated && match.contentTranslated.trim());
+                const hasBody  = hasBodyRaw && bodyVerified;
+                const hasTitle = !!(match.nameTranslated && match.nameTranslated.trim()) && titleVerified;
+                if (hasBodyRaw && !bodyVerified) staleBody++;
+                if (!hasBody && !hasTitle) { skipped++; continue; }
+
+                // Preset regex scripts only ever take the title. A body in the
+                // file (an older export, or a hand-edited one) is ignored —
+                // writing it would put translated prose where a regex pattern
+                // belongs.
+                if (it.titleOnly) {
+                    if (!hasTitle) { skipped++; continue; }
+                    setCacheTitle(ns, it.id, match.nameTranslated.trim());
+                    applied++;
+                    continue;
+                }
+
+                if (hasBody) {
+                    // Store in the same "### {title}\n\n{body}" shape a real
+                    // translation run produces, so every reader of the cache
+                    // (JSON export, live-apply, 👀, etc.) sees a normal entry.
+                    const heading = hasTitle ? match.nameTranslated.trim() : name;
+                    setCache(ns, it.id, `### ${heading}\n\n${match.contentTranslated.trim()}`);
+                    clearCachedTitle(ns, it.id);
+                } else {
+                    setCacheTitle(ns, it.id, match.nameTranslated.trim());
+                }
+                applied++;
+            }
+
+            renderList();
+            try { updateCacheStatsUI(); } catch (e) {}
+            if (typeof toastr!=='undefined') {
+                const dupNote = (dupContent.size || dupName.size) ? ' (중복된 원문/제목 일부는 안전을 위해 건너뜀)' : '';
+                const staleNote = staleBody ? ` · 원문이 달라 본문 번역 ${staleBody}개는 적용하지 않음` : '';
+                if (applied) toastr.success(`번역 메모리 적용: ${applied}개 매칭, ${skipped}개 매칭 실패${staleNote}${dupNote}`);
+                else toastr.warning(`매칭되는 항목이 없습니다 (${skipped}개 미매칭)${staleNote}${dupNote}`);
+            }
+        } catch (err) {
+            console.error(`[${EXT}] TM import failed`, err);
+            if (typeof toastr!=='undefined') toastr.error('번역 메모리 가져오기 실패: ' + (err?.message || err));
+        }
+    });
+
+    // ── Apply Live (writes into ST directly, no file round-trip) ──────
+    // Preset  → the preset file (always the whole preset, to keep it intact)
+    // WI      → the world-info book (selected entries only, if any selected)
+    // 봇카드  → the character PNG   (selected fields only, if any selected)
+    page.querySelector(`#${idPfx}-apply`)?.addEventListener('click', async () => {
+        if (!items.length) { if (typeof toastr!=='undefined') toastr.warning('로드된 데이터가 없습니다'); return; }
+        const srcSel = page.querySelector(`#${idPfx}-sel`);
+        const srcVal = srcSel?.value || '';
+        const label = getSourceName(kind, page, idPfx);
+
+        const checkedIds = new Set(
+            Array.from(page.querySelectorAll('.pt-block-item.selected'))
+                .map(el => el.dataset.id)
+                .filter(Boolean)
+        );
+        const kindLabel = kind === 'wi' ? '월드인포' : kind === 'char' ? '봇카드' : '프리셋';
+        let scopeLine;
+        if (kind === 'preset') {
+            scopeLine = '모든 토글 (선택 불가)';
+        } else if (checkedIds.size) {
+            scopeLine = `선택한 ${checkedIds.size}개`;
+        } else {
+            scopeLine = `로드된 전체 ${items.length}개`;
+        }
+
+        // 봇카드는 번역 대상이 필드 본문뿐이라 "제목만"이라는 개념이 없다.
+        let titlesOnly = false;
+        if (kind !== 'char') {
+            const scope = await askChoice(`⚡ "${label}" ${kindLabel}에 무엇을 적용할까요?`, [
+                { v: 'title', label: '📛 제목만 적용 (원문 보존)' },
+                { v: 'all',   label: '✦ 모두 적용 (제목 + 본문)' },
+            ]);
+            if (!scope) return;
+            titlesOnly = scope === 'title';
+        }
+
+        // 봇카드는 제목이라는 게 없으므로 "제목 + 본문"이라고 쓰면 사실과 다르다.
+        const whatLine = kind === 'char'
+            ? '본문'
+            : (titlesOnly ? '제목만 (본문 원문 유지)' : '제목 + 본문');
+        const ok = confirm(
+            `"${label}" ${kindLabel}에 번역을 적용합니다.\n\n` +
+            `적용 대상: ${whatLine}\n` +
+            `범위: ${scopeLine}\n\n` +
+            `파일을 덮어쓰며 되돌릴 수 없습니다.`
+        );
+        if (!ok) return;
+
+        try {
+            if (kind === 'preset') {
+                const r = await applyPresetLive(srcVal, titlesOnly);
+                if (typeof toastr!=='undefined') {
+                    const note = r.isCurrent ? '' : ' — 현재 로드된 프리셋이 아니라 화면엔 반영되지 않음, 다음에 불러올 때 적용된 내용이 보입니다';
+                    const extras = [
+                        r.regexRenamed  ? `정규식 ${r.regexRenamed}개`  : '',
+                        r.groupRenamed  ? `그룹 ${r.groupRenamed}개`    : '',
+                        r.runnerRenamed ? `JS러너 ${r.runnerRenamed}개` : '',
+                    ].filter(Boolean).join(' · ');
+                    const rx = extras ? ` · ${extras}` : '';
+                    toastr.success(`"${r.targetName}"에 적용됨 (${r.applied}개 필드${rx})${note}`);
+                    if (r.regexRenamed) {
+                        toastr.info('정규식 이름은 확장 > 정규식 창을 다시 열면 새 이름으로 보입니다');
+                    }
+                    // These belong to other extensions, which cache their own
+                    // copy keyed by preset name — they re-read it when the
+                    // preset is re-selected.
+                    if (r.groupReloadFailed) {
+                        toastr.warning(
+                            '그룹명을 저장했지만 ST-BaiBai-Tools 캐시를 새로 읽게 하지 못했습니다. ' +
+                            '되돌아갈 수 있으니, 그 프리셋을 선택하지 않은 상태에서 다시 적용하세요.',
+                            '', { timeOut: 12000 }
+                        );
+                    } else if (r.isCurrent && r.runnerRenamed && !r.runnerLiveUpdated) {
+                        toastr.info('JS러너 이름은 프리셋을 바꿨다 돌아오면 새 이름으로 보입니다');
+                    }
+                }
+            } else if (kind === 'wi') {
+                const r = await applyWorldInfoLive(srcVal, checkedIds, titlesOnly);
+                if (typeof toastr!=='undefined') {
+                    toastr.success(`"${r.targetName}"에 적용됨 (엔트리 ${r.entries}개 · ${r.applied}개 필드)`);
+                }
+            } else if (kind === 'char') {
+                const r = await applyCharacterLive(srcVal, checkedIds);
+                if (typeof toastr!=='undefined') {
+                    const note = r.isCurrent ? ' — 편집창에 바로 안 보이면 캐릭터를 다시 선택하세요' : '';
+                    toastr.success(`"${r.targetName}"에 적용됨 (${r.applied}개 필드)${note}`);
+                }
+            }
+        } catch (err) {
+            console.error(`[${EXT}] live apply failed (${kind})`, err);
+            if (typeof toastr!=='undefined') toastr.error('즉시 적용 실패: ' + (err?.message || err));
+        }
+    });
 }
 
 // Collect items: selected ones if any, else all
@@ -2058,9 +3417,14 @@ function getSourceName(kind, page, idPfx) {
 // ── Panel ──────────────────────────────────────────────────────────────
 function openPanel() {
     PDOC.getElementById('pt-panel')?.classList.remove('pt-hidden');
+    wakePages();
 }
 function closePanel() {
     PDOC.getElementById('pt-panel')?.classList.add('pt-hidden');
+    // Give ST back a small document — see PAGE_HOOKS.
+    sleepPages();
+    // A modal left open would otherwise sit there holding its own listeners.
+    PDOC.getElementById('pt-choice-modal')?.remove();
 }
 
 // Shows the model configured in the extension settings next to the status
@@ -2069,7 +3433,13 @@ function updateStatusModel() {
     const el = PDOC.getElementById('pt-status-model');
     if (!el) return;
     const c = cfg();
-    const model = (c.model === '__custom__' ? (c.customModelName || '') : (c.model || '')).trim();
+    let model;
+    if (usingStProfile()) {
+        const pr = listStProfiles().find(x => x.id === c.stProfileId);
+        model = pr ? `프로필: ${pr.name}` : '프로필 미선택';
+    } else {
+        model = (c.model === '__custom__' ? (c.customModelName || '') : (c.model || '')).trim();
+    }
     el.textContent = model ? `· ${model}` : '';
     el.title = model || '';
 }
@@ -2165,6 +3535,8 @@ function buildPanel() {
                 if (currentVal && [...sel.options].some(o => o.value === currentVal)) {
                     sel.value = currentVal;
                 }
+                // The searchable combo mirrors this select's label — re-sync it.
+                sel._ptSyncCombo?.();
             };
             refreshSelect('pt-preset', listAllPresets);
             refreshSelect('pt-wi',     listAllWorldInfos);
@@ -2344,10 +3716,18 @@ function buildFab() {
 // ── Settings HTML ──────────────────────────────────────────────────────
 function buildSettingsHTML() {
     const c=cfg();
-    const langOpts=[['Korean','한국어'],['English','English'],['Japanese','日本語'],['Chinese (Simplified)','简体中文'],['Chinese (Traditional)','繁體中文'],['Polish','Polski'],['__custom__','⚙️ 직접 입력']]
-        .map(([v,l])=>`<option value="${v}" ${c.targetLang===v?'selected':''}>${l}</option>`).join('');
-    const isCustomLang = c.targetLang === '__custom__';
+    const LANG_CHOICES=[['Korean','한국어'],['English','English'],['Japanese','日本語'],['Chinese (Simplified)','简体中文'],['Chinese (Traditional)','繁體中文'],['Polish','Polski'],['__custom__','⚙️ 직접 입력']];
+    const mkLangOpts=(cur,withSame)=>[...(withSame?[['__same__','↳ 본문과 동일']]:[]),...LANG_CHOICES]
+        .map(([v,l])=>`<option value="${v}" ${cur===v?'selected':''}>${l}</option>`).join('');
+    const langOpts      = mkLangOpts(c.targetLang, false);
+    const titleLangOpts = mkLangOpts(c.titleLang||'__same__', true);
+    const noteLangOpts  = mkLangOpts(c.noteLang||'Korean', false);
+    const isCustomLang      = c.targetLang === '__custom__';
+    const isCustomTitleLang = c.titleLang  === '__custom__';
+    const isCustomNoteLang  = c.noteLang   === '__custom__';
     const provOpts=PROVIDER_LIST.map(p=>`<option value="${p.key}" ${(c.provider||'openai')===p.key?'selected':''}>${p.label}</option>`).join('');
+    const isStProfile = (c.provider||'openai') === ST_PROFILE;
+    const profileOpts = buildProfileOptions();
     const currentProv=c.provider||'openai', modelList=PROVIDER_MODELS[currentProv]||[];
     const currentModel=c.model||'', isCustomMdl=currentModel==='__custom__';
     let modelOpts='<option value="">모델 선택...</option>';
@@ -2370,9 +3750,14 @@ function buildSettingsHTML() {
       <div class="pt-ext-row" style="margin-top:2px;"><button id="pt-open-panel-btn" class="menu_button" style="flex:1;"><i class="fa-solid fa-language"></i>&nbsp;패널 열기</button></div>
       <label class="checkbox_label" style="margin-top:8px;margin-bottom:2px;"><input type="checkbox" id="pt-fab-toggle" ${c.fabVisible!==false?'checked':''} class="checkbox"><span>플로팅 버튼 표시🐳</span></label>
       <small style="display:block;margin-left:24px;margin-bottom:8px;color:var(--SmartThemeQuoteColor,#888);font-size:11px;line-height:1.5;">언제든지 패널을 열 수 있는 아이콘입니다.</small>
-      <div class="pt-ext-row"><label for="pt-target-lang">번역 언어</label><select id="pt-target-lang" class="text_pole" style="max-width:160px;">${langOpts}</select></div>
+      <label style="font-weight:600;font-size:12px;display:block;margin:10px 0 4px;">번역 언어</label>
+      <div class="pt-ext-row"><label for="pt-title-lang">제목</label><select id="pt-title-lang" class="text_pole" style="max-width:160px;">${titleLangOpts}</select></div>
+      <div id="pt-custom-title-lang-row" class="pt-ext-row" style="${isCustomTitleLang?'':'display:none;'}"><label for="pt-custom-title-lang">Language</label><input id="pt-custom-title-lang" class="text_pole" type="text" value="${esc(c.titleCustomLang||'')}" placeholder="예: Français" style="max-width:160px;"></div>
+      <div class="pt-ext-row"><label for="pt-target-lang">본문</label><select id="pt-target-lang" class="text_pole" style="max-width:160px;">${langOpts}</select></div>
       <div id="pt-custom-lang-row" class="pt-ext-row" style="${isCustomLang?'':'display:none;'}"><label for="pt-custom-lang">Language</label><input id="pt-custom-lang" class="text_pole" type="text" value="${esc(c.customLang||'')}" placeholder="예: Français, Español" style="max-width:160px;"></div>
-      <small id="pt-custom-lang-hint" style="display:${isCustomLang?'block':'none'};margin-bottom:8px;color:var(--SmartThemeQuoteColor,#888);font-size:11px;line-height:1.5;">번역 요청에 그대로 쓰이는 값입니다. 영어 언어명 권장 (예: French).</small>
+      <div class="pt-ext-row"><label for="pt-note-lang">주석</label><select id="pt-note-lang" class="text_pole" style="max-width:160px;">${noteLangOpts}</select></div>
+      <div id="pt-custom-note-lang-row" class="pt-ext-row" style="${isCustomNoteLang?'':'display:none;'}"><label for="pt-custom-note-lang">Language</label><input id="pt-custom-note-lang" class="text_pole" type="text" value="${esc(c.noteCustomLang||'')}" placeholder="예: Français" style="max-width:160px;"></div>
+      <small style="display:block;margin-bottom:8px;color:var(--SmartThemeQuoteColor,#888);font-size:11px;line-height:1.5;">제목·본문·주석을 각각 다른 언어로 번역할 수 있습니다. 제목의 "본문과 동일"은 본문 언어를 따릅니다. 직접 입력 값은 번역 요청에 그대로 쓰이므로 영어 언어명을 권장합니다 (예: French).<br>주석은 본문 아래에 <code>{{// ======== [🌐내용 번역] ... ========}}</code> 블록으로 붙습니다.</small>
       <div class="pt-ext-row"><label for="pt-title-batch">제목 번역 묶음 개수</label><input id="pt-title-batch" class="text_pole" type="number" min="1" max="50" step="1" value="${c.titleBatchSize||15}" style="max-width:80px;"></div>
       <div class="pt-ext-row"><label for="pt-req-delay">요청 간 대기(ms)</label><input id="pt-req-delay" class="text_pole" type="number" min="0" max="60000" step="50" value="${c.requestDelayMs??60}" style="max-width:80px;"></div>
       <small style="display:block;margin-bottom:8px;color:var(--SmartThemeQuoteColor,#888);font-size:11px;line-height:1.5;">"제목만" 번역은 여러 제목을 한 요청으로 묶어 보냅니다. 본문 번역은 항상 토글 1개당 1요청이며, 대기 시간으로 속도를 조절합니다. API 분당 한도(예: Vertex AI)에 걸리면 묶음 개수를 늘리고 대기 시간을 키우세요.</small>
@@ -2393,11 +3778,13 @@ function buildSettingsHTML() {
       <!-- (2) API 설정 구역 -->
       <label style="font-weight:600;font-size:13px;display:block;margin-bottom:6px;">API 설정</label>
       <div class="pt-ext-row"><label>프로바이더</label><select id="pt-provider" class="text_pole" style="max-width:180px;">${provOpts}</select></div>
-      <div class="pt-ext-row"><label>모델</label><select id="pt-model-select" class="text_pole" style="max-width:180px;">${modelOpts}</select></div>
-      <div id="pt-custom-model-row" class="pt-ext-row" style="${isCustomMdl?'':'display:none;'}"><label>모델명 입력</label><input id="pt-model-custom" class="text_pole" type="text" value="${esc(c.customModelName||'')}" placeholder="모델명 직접 입력" style="max-width:180px;"></div>
-      <div id="pt-params-wrap" style="margin-top:4px;"></div>
-      <label class="checkbox_label" style="margin-top:10px;margin-bottom:6px;"><input type="checkbox" id="pt-use-proxy" ${c.useReverseProxy?'checked':''}><span>리버스 프록시 사용</span></label>
-      <div id="pt-proxy-wrap" style="${c.useReverseProxy?'':'display:none;'}">
+      <div id="pt-profile-row" class="pt-ext-row" style="${isStProfile?'':'display:none;'}"><label for="pt-profile-select">프로필</label><select id="pt-profile-select" class="text_pole" style="max-width:180px;">${profileOpts}</select></div>
+      <small id="pt-profile-hint" style="display:${isStProfile?'block':'none'};margin-bottom:8px;color:var(--SmartThemeQuoteColor,#888);font-size:11px;line-height:1.5;">SillyTavern 연결 프로필의 API·모델·키·프록시·프리셋을 그대로 사용합니다. 모델과 샘플링 값은 프로필이 정하므로 아래 항목은 표시되지 않습니다.</small>
+      <div id="pt-model-row" class="pt-ext-row" style="${isStProfile?'display:none;':''}"><label>모델</label><select id="pt-model-select" class="text_pole" style="max-width:180px;">${modelOpts}</select></div>
+      <div id="pt-custom-model-row" class="pt-ext-row" style="${(isCustomMdl&&!isStProfile)?'':'display:none;'}"><label>모델명 입력</label><input id="pt-model-custom" class="text_pole" type="text" value="${esc(c.customModelName||'')}" placeholder="모델명 직접 입력" style="max-width:180px;"></div>
+      <div id="pt-params-wrap" style="margin-top:4px;${isStProfile?'display:none;':''}"></div>
+      <label id="pt-proxy-toggle-row" class="checkbox_label" style="margin-top:10px;margin-bottom:6px;${isStProfile?'display:none;':''}"><input type="checkbox" id="pt-use-proxy" ${c.useReverseProxy?'checked':''}><span>리버스 프록시 사용</span></label>
+      <div id="pt-proxy-wrap" style="${(c.useReverseProxy&&!isStProfile)?'':'display:none;'}">
         <div class="pt-ext-row"><label>프록시 URL</label><input id="pt-proxy-url" class="text_pole" type="text" value="${esc(c.reverseProxyUrl||'')}" placeholder="https://..." style="max-width:200px;"></div>
         <div class="pt-ext-row"><label>프록시 비밀번호</label><input id="pt-proxy-pw" class="text_pole" type="password" value="${esc(c.reverseProxyPassword||'')}" placeholder="(선택)" style="max-width:200px;"></div>
       </div>
@@ -2424,6 +3811,41 @@ function buildSettingsHTML() {
     </div>
   </div>
 </div>`;
+}
+
+// Options for the ST 프로필 picker. An empty Connection Manager (or an ST too
+// old to expose one) yields a single disabled row rather than a silent blank.
+function buildProfileOptions() {
+    const c = cfg();
+    const profiles = listStProfiles();
+    if (!profiles.length) {
+        return '<option value="">(사용 가능한 연결 프로필 없음)</option>';
+    }
+    const cur = c.stProfileId || '';
+    let html = `<option value="" ${cur?'':'selected'}>— 프로필 선택 —</option>`;
+    for (const pr of profiles) {
+        const detail = pr.model ? ` (${pr.model})` : '';
+        html += `<option value="${esc(pr.id)}" ${cur===pr.id?'selected':''}>${esc(pr.name + detail)}</option>`;
+    }
+    return html;
+}
+
+// A profile owns the model, sampling and proxy, so those controls are hidden
+// rather than left showing values that no longer affect anything.
+function applyProviderModeUI() {
+    const on = usingStProfile();
+    const show = (id, visible) => { const el = document.getElementById(id); if (el) el.style.display = visible ? '' : 'none'; };
+    show('pt-profile-row', on);
+    show('pt-profile-hint', on);
+    show('pt-model-row', !on);
+    show('pt-params-wrap', !on);
+    show('pt-proxy-toggle-row', !on);
+    show('pt-custom-model-row', !on && cfg().model === '__custom__');
+    show('pt-proxy-wrap', !on && !!cfg().useReverseProxy);
+    if (on) {
+        const sel = document.getElementById('pt-profile-select');
+        if (sel) sel.innerHTML = buildProfileOptions();   // profiles may have changed since render
+    }
 }
 
 function updateModelDropdown() {
@@ -2498,9 +3920,18 @@ jQuery(async()=>{
         saveSettingsDebounced();
         const isCustom = this.value === '__custom__';
         $('#pt-custom-lang-row').toggle(isCustom);
-        $('#pt-custom-lang-hint').toggle(isCustom);
     });
     $('#pt-custom-lang').on('input',function(){cfg().customLang=this.value;saveSettingsDebounced();});
+    $('#pt-title-lang').on('change',function(){
+        cfg().titleLang=this.value; saveSettingsDebounced();
+        $('#pt-custom-title-lang-row').toggle(this.value === '__custom__');
+    });
+    $('#pt-custom-title-lang').on('input',function(){cfg().titleCustomLang=this.value;saveSettingsDebounced();});
+    $('#pt-note-lang').on('change',function(){
+        cfg().noteLang=this.value; saveSettingsDebounced();
+        $('#pt-custom-note-lang-row').toggle(this.value === '__custom__');
+    });
+    $('#pt-custom-note-lang').on('input',function(){cfg().noteCustomLang=this.value;saveSettingsDebounced();});
     $('#pt-title-batch').on('change',function(){
         let v = parseInt(this.value,10);
         if (isNaN(v) || v < 1) v = 1;
@@ -2532,7 +3963,19 @@ jQuery(async()=>{
         if (label) label.textContent = v + 'px';
         applyFontSizes();
     });
-    $('#pt-provider').on('change',function(){cfg().provider=this.value;cfg().model=(PROVIDER_MODELS[this.value]||[])[0]||'';saveSettingsDebounced();updateModelDropdown();buildParamsUI();updateStatusModel();});
+    $('#pt-provider').on('change',function(){
+        cfg().provider=this.value;
+        // Keep the previously chosen model when switching to 프로필 — switching
+        // back should land on the same provider/model the person had set up.
+        if (this.value !== ST_PROFILE) cfg().model=(PROVIDER_MODELS[this.value]||[])[0]||'';
+        saveSettingsDebounced();
+        if (this.value !== ST_PROFILE) { updateModelDropdown(); buildParamsUI(); }
+        applyProviderModeUI();
+        updateStatusModel();
+    });
+    $(document).on('change','#pt-profile-select',function(){cfg().stProfileId=this.value;saveSettingsDebounced();updateStatusModel();});
+    // The Connection Manager list can change while the drawer sits open.
+    $(document).on('mousedown','#pt-profile-select',function(){ const v=cfg().stProfileId||''; this.innerHTML=buildProfileOptions(); this.value=v; });
     $(document).on('change','#pt-model-select',function(){cfg().model=this.value;saveSettingsDebounced();const cr=document.getElementById('pt-custom-model-row');if(cr)cr.style.display=(this.value==='__custom__')?'':'none';updateStatusModel();});
     $(document).on('input','#pt-model-custom',function(){cfg().customModelName=this.value;saveSettingsDebounced();updateStatusModel();});
     $('#pt-use-proxy').on('change',function(){cfg().useReverseProxy=this.checked;saveSettingsDebounced();$('#pt-proxy-wrap').toggle(this.checked);});
@@ -2543,7 +3986,13 @@ jQuery(async()=>{
     $('#pt-fab-toggle').on('change',function(){
         cfg().fabVisible=this.checked;saveSettingsDebounced();
         if(this.checked){if(!PDOC.getElementById('pt-fab'))buildFab();}
-        else PDOC.getElementById('pt-fab')?.remove();
+        else {
+            // Also stop the re-mount watcher — otherwise its 1.5s timer keeps
+            // running for the life of the tab with nothing left to watch.
+            clearInterval(window.__stPresetTranslator_fabWatcher);
+            window.__stPresetTranslator_fabWatcher = null;
+            PDOC.getElementById('pt-fab')?.remove();
+        }
     });
     $('#pt-open-panel-btn').on('click', () => openPanel());
     $('#pt-clear-cache-btn').on('click', async () => {
@@ -2562,6 +4011,7 @@ jQuery(async()=>{
 
     buildPanel();
     buildParamsUI();
+    applyProviderModeUI();
 
     function tryFab(n){
         if(!cfg().fabVisible||PDOC.getElementById('pt-fab'))return;
