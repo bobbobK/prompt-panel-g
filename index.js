@@ -3895,7 +3895,7 @@ function buildSettingsHTML() {
 <div class="pt-extension-settings">
   <div class="inline-drawer">
     <div class="inline-drawer-toggle inline-drawer-header">
-        <b>Prompt Panel</b>
+        <b>Prompt Panel G</b>
         <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
     </div>
     <div class="inline-drawer-content">
