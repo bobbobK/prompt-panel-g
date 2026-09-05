@@ -131,9 +131,14 @@ function cfg() {
     if (!extension_settings[EXT]) extension_settings[EXT] = {};
     const c = extension_settings[EXT];
     if (!c.targetLang)    c.targetLang    = 'Korean';
-    // Per-area target languages. '__same__' = follow 본문(targetLang), which is
-    // the default so existing installs keep behaving exactly as before.
-    if (!c.titleLang)     c.titleLang     = '__same__';
+    // Per-area target languages. 제목에는 '본문과 동일'(__same__) 선택지가 없고
+    // 항상 구체적인 언어를 가진다. 기존 설정이 '__same__'(또는 미설정)이면 그때
+    // 실제로 쓰이던 언어 = 본문 언어를 그대로 박아 넣는다. 해석 결과가 같으므로
+    // 이미 쌓인 제목 번역 캐시의 키도 그대로 유지된다.
+    if (!c.titleLang || c.titleLang === '__same__') {
+        c.titleLang = c.targetLang;
+        if (c.targetLang === '__custom__' && !c.titleCustomLang) c.titleCustomLang = c.customLang || '';
+    }
     // 주석 has no "follow 본문" mode — a 주석 is a reading aid, so it defaults to
     // 한국어 outright. Migrate anyone still carrying the old '__same__' value.
     if (!c.noteLang || c.noteLang === '__same__') c.noteLang = 'Korean';
@@ -151,6 +156,12 @@ function cfg() {
     // Throttling / batching
     if (typeof c.titleBatchSize !== 'number' || c.titleBatchSize < 1) c.titleBatchSize = 15;
     if (typeof c.requestDelayMs !== 'number' || c.requestDelayMs < 0) c.requestDelayMs = 60;
+    // 동시에 보낼 번역 요청 수. 1 = 예전과 완전히 같은 순차 실행(기본값).
+    if (typeof c.concurrency !== 'number' || c.concurrency < 1) c.concurrency = 1;
+    // 429 / 5xx / 네트워크 오류에 한해 다시 보내는 횟수. 4xx는 재시도하지 않는다.
+    if (typeof c.maxRetries !== 'number' || c.maxRetries < 0) c.maxRetries = 2;
+    // 응답이 오지 않는 요청을 끊는 상한. 이게 없으면 한 항목에서 영원히 멈춘다.
+    if (typeof c.requestTimeoutMs !== 'number' || c.requestTimeoutMs < 5000) c.requestTimeoutMs = 120000;
     if (!c.parameters) c.parameters = {};
     for (const k in DEFAULT_PARAMS) if (!c.parameters[k]) c.parameters[k] = {...DEFAULT_PARAMS[k]};
     return c;
@@ -272,12 +283,14 @@ function resolveLang(sel, custom) {
 }
 
 // effLang(area) — area is 'title' | 'note' | undefined (= 본문/body, the default).
-// 제목/주석 default to '__same__', meaning they follow the 본문 language, so an
-// install that never touches the new selects behaves identically to before.
+// 주석은 '본문과 동일'이 없고 한국어가 기본이다. 제목도 마찬가지로 구체적인
+// 언어를 갖도록 cfg()에서 옮겨지지만, 혹시 남아 있는 옛 '__same__' 값은 예전처럼
+// 본문 언어로 읽어 준다.
 function effLang(area) {
     const c = cfg();
     const body = resolveLang(c.targetLang, c.customLang);
     if (area === 'title') {
+        // 하위 호환: 마이그레이션 전에 저장된 옛 값이면 본문 언어를 따른다.
         if (!c.titleLang || c.titleLang === '__same__') return body;
         return resolveLang(c.titleLang, c.titleCustomLang);
     }
@@ -302,9 +315,9 @@ const setCache  = (ns, id, t) => {
 //     and fall back to the title-only cache otherwise.
 const titleNS = (ns) => `${ns}@title`;
 // Title entries are keyed by the 제목 language, body entries by the 본문 language,
-// so the two areas can target different languages without colliding. When 제목 is
-// left at '__same__' both resolve to the same string and the keys are unchanged
-// from previous versions (existing caches keep matching).
+// so the two areas can target different languages without colliding. 제목이 본문과
+// 같은 언어를 가리키면 두 값이 같은 문자열로 해석되어, 예전 버전에서 쌓인 캐시가
+// 그대로 계속 맞는다.
 const ckT = (ns, id) => `${titleNS(ns)}::${id}::${effLang('title')}`;
 // Drop a title-only entry. Called when a full translation succeeds, so the
 // newer full translation's title wins. Without this, a stale title-only
@@ -348,6 +361,32 @@ function estimateTokens(text) {
 }
 
 let isBusy=false, stopReq=false;
+
+// 진행 중인 요청과 "요청 간 대기" 타이머를 모아 둔다. 중단 버튼은 예전에 플래그만
+// 세웠기 때문에 이미 날아간 요청의 응답과 대기 시간이 끝나야 멈췄다. 이제 둘 다
+// 즉시 깨워서 누른 순간 멈춘다.
+const inFlight = new Set();
+const sleepWaiters = new Set();
+
+// 사용자가 중단해서 끝난 것을 일반 실패와 구분하는 표식.
+function stopError() { const e = new Error('중단됨'); e.__stopped = true; return e; }
+
+// stopReq가 서면 즉시 깨어나는 대기. 그 외에는 setTimeout과 동일하다.
+function sleepCancellable(ms) {
+    if (!(ms > 0) || stopReq) return Promise.resolve();
+    return new Promise(resolve => {
+        const w = {};
+        w.done = () => { clearTimeout(w.timer); sleepWaiters.delete(w); resolve(); };
+        w.timer = setTimeout(w.done, ms);
+        sleepWaiters.add(w);
+    });
+}
+
+function requestStop() {
+    stopReq = true;
+    for (const ac of [...inFlight])     { try { ac.abort(); } catch (e) {} }
+    for (const w  of [...sleepWaiters]) { try { w.done();   } catch (e) {} }
+}
 
 // Each tab registers { sleep, wake } here. A loaded 프리셋 can be 471 toggles
 // (~100KB of text), which becomes several thousand DOM nodes plus their
@@ -394,7 +433,8 @@ function budgetFor(messages) {
 // Single exit point for every model call. `tweak` may adjust the raw-provider
 // payload (used by 재번역 to nudge sampling); it is ignored on the profile path,
 // where sampling belongs to the profile's own completion preset.
-async function runCompletion(messages, tweak) {
+// 한 번의 호출 = 한 번의 요청. 타임아웃·재시도는 아래 runCompletion이 감싼다.
+async function runCompletionOnce(messages, tweak) {
     const c = cfg();
 
     if (usingStProfile()) {
@@ -447,19 +487,86 @@ async function runCompletion(messages, tweak) {
     }
     if (typeof tweak === 'function') tweak(parameters, params, providerParams);
 
-    const res = await fetch('/api/backends/chat-completions/generate', {
-        method: 'POST', headers: { ...getRequestHeaders(), 'Content-Type': 'application/json' },
-        body: JSON.stringify(parameters),
-    });
-    if (!res.ok) {
-        let msg = `HTTP ${res.status}`;
-        try { const err = await res.json(); msg = err?.error?.message || err?.message || msg; } catch (e) {}
-        throw new Error(msg);
+    // 응답이 영영 오지 않는 요청을 끊고, 중단 버튼이 진행 중인 요청까지 즉시
+    // 취소할 수 있게 한다. 성공 경로에서 오가는 값은 이전과 동일하다.
+    const ac = new AbortController();
+    inFlight.add(ac);
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; try { ac.abort(); } catch (e) {} }, requestTimeoutMs());
+    try {
+        const res = await fetch('/api/backends/chat-completions/generate', {
+            method: 'POST', headers: { ...getRequestHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify(parameters),
+            signal: ac.signal,
+        });
+        if (!res.ok) {
+            let msg = `HTTP ${res.status}`;
+            try { const err = await res.json(); msg = err?.error?.message || err?.message || msg; } catch (e) {}
+            // 상태 코드를 실어 보내야 재시도할 오류인지 판단할 수 있다.
+            const e = new Error(msg);
+            e.status = res.status;
+            const ra = res.headers?.get?.('retry-after');
+            if (ra) {
+                const s = String(ra).trim();
+                e.retryAfterMs = /^\d+$/.test(s) ? parseInt(s, 10) * 1000 : Math.max(0, Date.parse(s) - Date.now());
+            }
+            throw e;
+        }
+        const d = await res.json();
+        return (d.choices?.[0]?.message?.content?.trim()
+            || d.content?.[0]?.text?.trim()
+            || d.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '').trim();
+    } catch (e) {
+        // 타임아웃으로 끊은 것은 재시도 대상, 사용자가 중단한 것은 그대로 올린다.
+        if (e?.name === 'AbortError' && timedOut) {
+            const te = new Error(`요청 시간 초과 (${Math.round(requestTimeoutMs() / 1000)}초)`);
+            te.timeout = true;
+            throw te;
+        }
+        throw e;
+    } finally {
+        clearTimeout(timer);
+        inFlight.delete(ac);
     }
-    const d = await res.json();
-    return (d.choices?.[0]?.message?.content?.trim()
-        || d.content?.[0]?.text?.trim()
-        || d.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '').trim();
+}
+
+// 다시 보내면 결과가 달라질 수 있는 오류만 재시도한다. 키 오류·잘못된 모델명 같은
+// 4xx는 몇 번을 보내도 같으므로 그대로 실패시킨다.
+function isRetryableError(e) {
+    if (!e || e.__stopped || e.name === 'AbortError') return false;
+    if (e.timeout) return true;
+    const s = e.status;
+    if (typeof s === 'number') return s === 429 || (s >= 500 && s <= 599);
+    return /network|failed to fetch|networkerror|econnreset|socket hang up|timeout|timed out/i.test(e.message || '');
+}
+
+// 서버가 Retry-After를 주면 그걸 따르고, 없으면 지수 백오프 + 약간의 지터.
+function retryWaitMs(attempt, e) {
+    const ra = e?.retryAfterMs;
+    if (typeof ra === 'number' && isFinite(ra) && ra >= 0) return Math.min(60000, ra);
+    const base = Math.max(500, requestDelayMs());
+    return Math.min(30000, base * Math.pow(2, attempt) + Math.floor(Math.random() * 250));
+}
+
+// 모든 모델 호출의 단일 출입구. 성공 시 반환값은 예전과 같고, 일시적 실패일 때만
+// 사이에 대기를 두고 다시 보낸다.
+async function runCompletion(messages, tweak) {
+    const tries = maxRetries() + 1;
+    let lastErr = null;
+    for (let attempt = 0; attempt < tries; attempt++) {
+        if (stopReq) throw stopError();
+        try {
+            return await runCompletionOnce(messages, tweak);
+        } catch (e) {
+            lastErr = e;
+            if (stopReq || e?.name === 'AbortError' || e?.__stopped) throw stopError();
+            if (attempt === tries - 1 || !isRetryableError(e)) throw e;
+            const wait = retryWaitMs(attempt, e);
+            console.warn(`[${EXT}] 요청 실패 — ${wait}ms 후 재시도 (${attempt + 1}/${tries - 1}): ${e.message}`);
+            await sleepCancellable(wait);
+        }
+    }
+    throw lastErr;
 }
 
 // Prefill rides as an assistant/model turn. A profile hides its source, so read
@@ -1270,8 +1377,10 @@ async function runTranslation({ items, list, ns, pBar, pLabel, pWrap, btnStop, f
 
     const total=targets.length; let done=0;
 
-    for (const b of targets) {
-        if (stopReq) break;
+    // 항목 하나를 처리한다. 내용은 예전 순차 루프와 한 줄도 다르지 않고, 여러
+    // 개를 동시에 돌릴 수 있도록 함수로 떼어냈을 뿐이다 (항목끼리 공유 상태 없음).
+    const runOne = async (b) => {
+        if (stopReq) return;
         // Read the existing entry first: the half this run is NOT producing has
         // to survive, and forceRetranslate must only redo the half it targets.
         const prevFull  = getCached(ns, b.id);
@@ -1326,15 +1435,37 @@ async function runTranslation({ items, list, ns, pBar, pLabel, pWrap, btnStop, f
                     setBlockHTML(list,b.id,'<span class="pt-no-trans">번역 전</span>');
                 }
             } catch(err) {
-                setBlockHTML(list,b.id,`<span style="color:#ef4444;font-size:11px;">❌ ${esc(err.message)}</span>`);
+                if (err?.__stopped) {
+                    // 사용자가 멈춘 것은 실패가 아니다 — 원래 보이던 것을 되돌린다.
+                    setBlockHTML(list,b.id,prevFull?esc(prevFull):'<span class="pt-no-trans">번역 전</span>');
+                } else {
+                    setBlockHTML(list,b.id,`<span style="color:#ef4444;font-size:11px;">❌ ${esc(err.message)}</span>`);
+                }
             }
         }
-        done++;
-        const pct=Math.round(done/total*100);
-        pBar.style.width=pct+'%';
-        pLabel.textContent=`${done} / ${total}  (${pct}%)`;
-        if (!stopReq) await new Promise(r=>setTimeout(r, requestDelayMs()));
-    }
+    };
+
+    // 동시 실행 풀. 기본값 1이면 예전과 똑같이 한 번에 하나씩, 같은 순서로 돈다.
+    // 항목의 결과는 id로 캐시에 들어가므로 완료 순서는 결과에 영향을 주지 않는다.
+    let qi = 0;
+    const worker = async () => {
+        while (!stopReq) {
+            const idx = qi++;
+            if (idx >= targets.length) return;
+            // runOne은 번역 실패를 스스로 처리한다. 그 밖의 예외로 한 레인이
+            // 죽어도 나머지 레인과 마무리 처리(isBusy 해제 등)는 그대로 돌게 둔다.
+            try { await runOne(targets[idx]); }
+            catch (e) { console.error(`[${EXT}] 항목 처리 실패`, e); }
+            done++;
+            const pct=Math.round(done/total*100);
+            pBar.style.width=pct+'%';
+            pLabel.textContent=`${done} / ${total}  (${pct}%)`;
+            // 남은 항목이 있을 때만 쉰다 — 예전에는 마지막 항목 뒤에도 한 번 더 쉬었다.
+            if (!stopReq && qi < targets.length) await sleepCancellable(requestDelayMs());
+        }
+    };
+    const lanes = Math.max(1, Math.min(concurrency(), targets.length));
+    await Promise.all(Array.from({ length: lanes }, () => worker()));
     // (translations now persist to IndexedDB automatically via setCache/dbDelete)
     try { updateCacheStatsUI(); } catch(e) {}
     isBusy=false;
@@ -2485,6 +2616,9 @@ async function applyCharacterLive(charIdRaw, selectedIds) {
 // Batch size and inter-request delay are user-configurable (extension drawer).
 const titleBatchSize  = () => Math.max(1, Math.min(50, cfg().titleBatchSize || 15));
 const requestDelayMs  = () => Math.max(0, cfg().requestDelayMs ?? 60);
+const concurrency     = () => Math.max(1, Math.min(8, cfg().concurrency || 1));
+const maxRetries      = () => Math.max(0, Math.min(5, cfg().maxRetries ?? 2));
+const requestTimeoutMs= () => Math.max(5000, cfg().requestTimeoutMs || 120000);
 
 function parseNumberedTitles(raw, expectedCount) {
     if (typeof raw !== 'string') return null;
@@ -2575,33 +2709,54 @@ async function runTitleTranslation({ items, list, ns, pBar, pLabel, pWrap, btnSt
         batches.push(targets.slice(i, i + bs));
     }
 
+    // 응답 줄 수가 배치와 어긋나면 예전에는 그 배치 전체(기본 15개)를 버렸다.
+    // 이제는 반씩 쪼개 다시 물어보고, 한 개까지 내려가면 한 번 더 시도한다.
+    // 개수가 맞는 응답만 채택하는 판정 자체는 그대로다 — 추측해서 넣지 않는다.
+    const translateNames = async (batch) => {
+        const tries = batch.length === 1 ? 2 : 1;
+        for (let attempt = 0; attempt < tries; attempt++) {
+            if (stopReq) return null;
+            try {
+                const t = await translateTitleBatch(batch.map(b => b.name));
+                if (t) return t;
+                console.warn(`[${EXT}] title batch reply did not match ${batch.length} items`);
+            } catch (err) {
+                if (stopReq || err?.__stopped) return null;
+                console.warn(`[${EXT}] title batch failed`, err);
+                // 키 오류 같은 확정적 실패는 쪼개 봐야 똑같이 실패한다.
+                if (!isRetryableError(err)) return null;
+            }
+        }
+        if (stopReq || batch.length === 1) return null;
+        const mid = Math.ceil(batch.length / 2);
+        const left = await translateNames(batch.slice(0, mid));
+        if (!stopReq) await sleepCancellable(requestDelayMs());
+        const right = stopReq ? null : await translateNames(batch.slice(mid));
+        if (!left && !right) return null;
+        return [
+            ...(left  || new Array(mid).fill(null)),
+            ...(right || new Array(batch.length - mid).fill(null)),
+        ];
+    };
+
     let done = 0, okCount = 0, failCount = 0;
     for (const batch of batches) {
         if (stopReq) break;
-        try {
-            const translated = await translateTitleBatch(batch.map(b => b.name));
-            if (translated) {
-                batch.forEach((b, i) => {
-                    setCacheTitle(ns, b.id, translated[i]);
-                    // Title-only blocks show the translated name in their
-                    // 번역 box (they have no body), so refresh it in place.
-                    if (b.titleOnly) setBlockHTML(list, b.id, esc(translated[i]));
-                });
-                okCount += batch.length;
-            } else {
-                // Ambiguous reply — discard this batch instead of guessing.
-                failCount += batch.length;
-                console.warn(`[${EXT}] title batch discarded (reply did not match ${batch.length} items)`);
-            }
-        } catch (err) {
-            failCount += batch.length;
-            console.warn(`[${EXT}] title batch failed`, err);
-        }
+        const translated = await translateNames(batch);
+        batch.forEach((b, i) => {
+            const v = translated?.[i];
+            if (!v) { failCount++; return; }
+            setCacheTitle(ns, b.id, v);
+            // Title-only blocks show the translated name in their
+            // 번역 box (they have no body), so refresh it in place.
+            if (b.titleOnly) setBlockHTML(list, b.id, esc(v));
+            okCount++;
+        });
         done += batch.length;
         const pct = Math.round(done / targets.length * 100);
         pBar.style.width = pct + '%';
         pLabel.textContent = `${done} / ${targets.length}  (${pct}%)`;
-        if (!stopReq) await new Promise(r => setTimeout(r, requestDelayMs()));
+        if (!stopReq && done < targets.length) await sleepCancellable(requestDelayMs());
     }
 
     try { updateCacheStatsUI(); } catch (e) {}
@@ -2995,7 +3150,7 @@ function buildPage({ page, idPfx, listFn, loadFn, selectable, icon, hint, isAsyn
             },
         });
     });
-    btnStop?.addEventListener('click',()=>{stopReq=true;});
+    btnStop?.addEventListener('click',()=>{requestStop();});
     page.querySelector(`#${idPfx}-clr`).addEventListener('click',()=>{
         // Respect selection: if items selected, clear only those; otherwise clear all loaded
         const selectedIds = [...list.querySelectorAll('.pt-block-item.selected')].map(el=>el.dataset.id).filter(Boolean);
@@ -3717,11 +3872,11 @@ function buildFab() {
 function buildSettingsHTML() {
     const c=cfg();
     const LANG_CHOICES=[['Korean','한국어'],['English','English'],['Japanese','日本語'],['Chinese (Simplified)','简体中文'],['Chinese (Traditional)','繁體中文'],['Polish','Polski'],['__custom__','⚙️ 직접 입력']];
-    const mkLangOpts=(cur,withSame)=>[...(withSame?[['__same__','↳ 본문과 동일']]:[]),...LANG_CHOICES]
+    const mkLangOpts=(cur)=>LANG_CHOICES
         .map(([v,l])=>`<option value="${v}" ${cur===v?'selected':''}>${l}</option>`).join('');
-    const langOpts      = mkLangOpts(c.targetLang, false);
-    const titleLangOpts = mkLangOpts(c.titleLang||'__same__', true);
-    const noteLangOpts  = mkLangOpts(c.noteLang||'Korean', false);
+    const langOpts      = mkLangOpts(c.targetLang);
+    const titleLangOpts = mkLangOpts(c.titleLang||'Korean');
+    const noteLangOpts  = mkLangOpts(c.noteLang||'Korean');
     const isCustomLang      = c.targetLang === '__custom__';
     const isCustomTitleLang = c.titleLang  === '__custom__';
     const isCustomNoteLang  = c.noteLang   === '__custom__';
@@ -3757,10 +3912,13 @@ function buildSettingsHTML() {
       <div id="pt-custom-lang-row" class="pt-ext-row" style="${isCustomLang?'':'display:none;'}"><label for="pt-custom-lang">Language</label><input id="pt-custom-lang" class="text_pole" type="text" value="${esc(c.customLang||'')}" placeholder="예: Français, Español" style="max-width:160px;"></div>
       <div class="pt-ext-row"><label for="pt-note-lang">주석</label><select id="pt-note-lang" class="text_pole" style="max-width:160px;">${noteLangOpts}</select></div>
       <div id="pt-custom-note-lang-row" class="pt-ext-row" style="${isCustomNoteLang?'':'display:none;'}"><label for="pt-custom-note-lang">Language</label><input id="pt-custom-note-lang" class="text_pole" type="text" value="${esc(c.noteCustomLang||'')}" placeholder="예: Français" style="max-width:160px;"></div>
-      <small style="display:block;margin-bottom:8px;color:var(--SmartThemeQuoteColor,#888);font-size:11px;line-height:1.5;">제목·본문·주석을 각각 다른 언어로 번역할 수 있습니다. 제목의 "본문과 동일"은 본문 언어를 따릅니다. 직접 입력 값은 번역 요청에 그대로 쓰이므로 영어 언어명을 권장합니다 (예: French).<br>주석은 본문 아래에 <code>{{// ======== [🌐내용 번역] ... ========}}</code> 블록으로 붙습니다.</small>
+      <small style="display:block;margin-bottom:8px;color:var(--SmartThemeQuoteColor,#888);font-size:11px;line-height:1.5;">제목·본문·주석을 각각 다른 언어로 번역할 수 있습니다. 직접 입력 값은 번역 요청에 그대로 쓰이므로 영어 언어명을 권장합니다 (예: French).<br>주석은 본문 아래에 <code>{{// ======== [🌐내용 번역] ... ========}}</code> 블록으로 붙습니다.</small>
       <div class="pt-ext-row"><label for="pt-title-batch">제목 번역 묶음 개수</label><input id="pt-title-batch" class="text_pole" type="number" min="1" max="50" step="1" value="${c.titleBatchSize||15}" style="max-width:80px;"></div>
       <div class="pt-ext-row"><label for="pt-req-delay">요청 간 대기(ms)</label><input id="pt-req-delay" class="text_pole" type="number" min="0" max="60000" step="50" value="${c.requestDelayMs??60}" style="max-width:80px;"></div>
-      <small style="display:block;margin-bottom:8px;color:var(--SmartThemeQuoteColor,#888);font-size:11px;line-height:1.5;">"제목만" 번역은 여러 제목을 한 요청으로 묶어 보냅니다. 본문 번역은 항상 토글 1개당 1요청이며, 대기 시간으로 속도를 조절합니다. API 분당 한도(예: Vertex AI)에 걸리면 묶음 개수를 늘리고 대기 시간을 키우세요.</small>
+      <div class="pt-ext-row"><label for="pt-concurrency">동시 번역 요청 수</label><input id="pt-concurrency" class="text_pole" type="number" min="1" max="8" step="1" value="${c.concurrency||1}" style="max-width:80px;"></div>
+      <div class="pt-ext-row"><label for="pt-max-retries">실패 시 재시도 횟수</label><input id="pt-max-retries" class="text_pole" type="number" min="0" max="5" step="1" value="${c.maxRetries??2}" style="max-width:80px;"></div>
+      <div class="pt-ext-row"><label for="pt-req-timeout">요청 제한 시간(초)</label><input id="pt-req-timeout" class="text_pole" type="number" min="5" max="600" step="5" value="${Math.round((c.requestTimeoutMs??120000)/1000)}" style="max-width:80px;"></div>
+      <small style="display:block;margin-bottom:8px;color:var(--SmartThemeQuoteColor,#888);font-size:11px;line-height:1.5;">"제목만" 번역은 여러 제목을 한 요청으로 묶어 보냅니다. 본문 번역은 항상 토글 1개당 1요청이며, 대기 시간으로 속도를 조절합니다. API 분당 한도(예: Vertex AI)에 걸리면 묶음 개수를 늘리고 대기 시간을 키우세요.<br><b>동시 번역 요청 수</b>는 기본 1(예전과 동일한 순차 실행)이며, 2~4로 올리면 본문 번역이 그만큼 빨라집니다. 한도(429)나 서버 오류·시간 초과는 자동으로 재시도하므로, 429가 잦으면 동시 수를 줄이고 대기 시간을 키우세요.</small>
       <div class="pt-ext-row"><label for="pt-theme">테마</label><select id="pt-theme" class="text_pole" style="max-width:160px;">${themeOpts}</select></div>
       <div class="pt-ext-row pt-slider-row">
         <label for="pt-orig-size">원문 글자 크기</label>
@@ -3945,6 +4103,27 @@ jQuery(async()=>{
         if (v > 60000) v = 60000;
         this.value = v;
         cfg().requestDelayMs = v; saveSettingsDebounced();
+    });
+    $('#pt-concurrency').on('change',function(){
+        let v = parseInt(this.value,10);
+        if (isNaN(v) || v < 1) v = 1;
+        if (v > 8) v = 8;
+        this.value = v;
+        cfg().concurrency = v; saveSettingsDebounced();
+    });
+    $('#pt-max-retries').on('change',function(){
+        let v = parseInt(this.value,10);
+        if (isNaN(v) || v < 0) v = 0;
+        if (v > 5) v = 5;
+        this.value = v;
+        cfg().maxRetries = v; saveSettingsDebounced();
+    });
+    $('#pt-req-timeout').on('change',function(){
+        let v = parseInt(this.value,10);
+        if (isNaN(v) || v < 5) v = 5;
+        if (v > 600) v = 600;
+        this.value = v;
+        cfg().requestTimeoutMs = v * 1000; saveSettingsDebounced();
     });
     $('#pt-theme').on('change',function(){cfg().theme=this.value;saveSettingsDebounced();const p=PDOC.getElementById('pt-panel');if(p)p.setAttribute('data-pt-theme',this.value);});
     $('#pt-orig-size').on('input', function(){
