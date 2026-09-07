@@ -139,11 +139,11 @@
 .pt-combo-native{display:none!important}
 .pt-combo{position:relative;flex:0 1 100%;min-width:0}
 .pt-combo-input{
-  width:100%;height:32px;box-sizing:border-box;padding:0 26px 0 9px;
-  background:var(--pt-select-bg);color:var(--pt-select-text);
-  border:1px solid var(--pt-border-strong);border-radius:10px;
+  width:100%;height:32px;box-sizing:border-box;padding:0 26px 0 9px !important;
+  background:var(--pt-select-bg) !important;color:var(--pt-select-text) !important;
+  border:1px solid var(--pt-border-strong) !important;border-radius:10px;
   font-size:12px;cursor:pointer;outline:none;
-  box-shadow:inset 0 1px 0 var(--pt-highlight);
+  box-shadow:inset 0 1px 0 var(--pt-highlight) !important;
   text-overflow:ellipsis;
 }
 .pt-combo-input::placeholder{color:var(--pt-text-dim);opacity:.8}
